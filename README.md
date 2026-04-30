@@ -16,4 +16,6 @@
 - Directional slideshow (start date + forward/backward + runtime)
 - Slideshow controls and pre-cache window
 - Cache clear and slideshow settings
-- Android wallpaper set, iOS image save for manual wallpaper
+- Android wallpaper set
+- iOS/macOS image save for manual wallpaper
+- Windows wallpaper set with style choice (Fill, Stretch, Fit)

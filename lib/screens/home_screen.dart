@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter/material.dart';
@@ -7,6 +8,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/apod_entry.dart';
 import '../models/slideshow_config.dart';
 import '../providers/app_providers.dart';
+import '../services/wallpaper_service.dart';
 import '../ui/app_theme.dart';
 import '../ui/cosmic_scaffold.dart';
 import '../widgets/apod_card.dart';
@@ -27,8 +29,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   // Keep controls visible initially, then tuck them away for immersive viewing.
   static const _controlAutoHideDelay = Duration(seconds: 5);
   static const _pointerWakeDebounce = Duration(milliseconds: 250);
-  // APOD rejects very large date windows; keep slideshow request bounded.
-  static const _maxSlideshowItems = 100;
+  // APOD allows 1000 requests/hour, but slideshow playback uses range fetches.
+  // This cap prevents oversized range payloads and keeps startup responsive.
+  static const _maxSlideshowItems = 1000; // APOD API limit
 
   Timer? _hideTimer;
   bool _controlsVisible = true;
@@ -79,7 +82,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 child: _controlsVisible
                     ? Padding(
                         padding: const EdgeInsets.only(bottom: 12),
-                        child: _buildTopControlPanel(context, key),
+                        child: _buildTopControlPanel(
+                          context,
+                          key,
+                          current.valueOrNull,
+                        ),
                       )
                     : Align(
                         alignment: Alignment.centerRight,
@@ -162,7 +169,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
 
   /// Floating control strip containing fetch actions and navigation affordances.
-  Widget _buildTopControlPanel(BuildContext context, String apiKey) {
+  Widget _buildTopControlPanel(
+    BuildContext context,
+    String apiKey,
+    ApodEntry? currentEntry,
+  ) {
     return Container(
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(18),
@@ -211,6 +222,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             _showControlsTemporarily();
             await _launchDirectionalSlideshow(context, apiKey);
           }),
+          if (currentEntry?.shouldRenderAsImage == true &&
+              currentEntry?.bestImageUrl != null)
+            _actionChip(context, 'Wallpaper', Icons.wallpaper, () async {
+              _showControlsTemporarily();
+              await _setCurrentAsWallpaper(context, currentEntry!);
+            }),
           _actionChip(
             context,
             _infoPanelVisible ? 'Hide Info' : 'Show Info',
@@ -237,8 +254,13 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     String apiKey,
   ) async {
     final previousEntryState = ref.read(currentEntryProvider);
-    final config = await _pickSlideshowConfig(context);
-    if (!mounted || config == null) return;
+    final latestAvailableDate = await _resolveLatestAvailableDate(apiKey);
+    if (!context.mounted) return;
+    final config = await _pickSlideshowConfig(
+      context,
+      latestAvailableDate: latestAvailableDate,
+    );
+    if (!context.mounted || config == null) return;
 
     final intervalSeconds = ref.read(slideshowIntervalProvider);
     // Runtime is translated to an estimated number of APOD dates to request.
@@ -247,17 +269,40 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       config.runDuration.inSeconds ~/ intervalSeconds,
     );
     final slideCount = min(requestedSlides, _maxSlideshowItems);
-    final today = _maxApodDate;
-    final safeSelectedDate = config.startDate.isAfter(today)
-        ? today
+    final safeSelectedDate = config.startDate.isAfter(latestAvailableDate)
+        ? latestAvailableDate
         : config.startDate;
+
+    if (config.direction == SlideshowDirection.forward &&
+        _isSameDay(safeSelectedDate, latestAvailableDate)) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'No forward slideshow is available from the latest APOD date.',
+          ),
+        ),
+      );
+      return;
+    }
 
     DateTime start = safeSelectedDate;
     DateTime end = safeSelectedDate;
 
     final availableWindow = config.direction == SlideshowDirection.forward
-        ? today.difference(safeSelectedDate).inDays + 1
+        ? latestAvailableDate.difference(safeSelectedDate).inDays + 1
         : safeSelectedDate.difference(_firstApodDate).inDays + 1;
+    if (availableWindow < 2) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'No additional APOD entries are available in that direction.',
+          ),
+        ),
+      );
+      return;
+    }
     final effectiveSlideCount = min(slideCount, max(0, availableWindow));
     if (effectiveSlideCount <= 0) {
       if (!context.mounted) return;
@@ -274,7 +319,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
     if (config.direction == SlideshowDirection.forward) {
       end = safeSelectedDate.add(Duration(days: days));
-      if (end.isAfter(today)) end = today;
+      if (end.isAfter(latestAvailableDate)) end = latestAvailableDate;
     } else {
       start = safeSelectedDate.subtract(Duration(days: days));
       if (start.isBefore(_firstApodDate)) start = _firstApodDate;
@@ -307,11 +352,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       final sanitized = items
           .where(
             (e) =>
-                !e.date.isAfter(today) &&
+                !e.date.isAfter(latestAvailableDate) &&
                 !e.date.isBefore(_firstApodDate) &&
-                (e.isImage
+                (e.shouldRenderAsImage
                     ? e.bestImageUrl != null
-                    : (e.url != null || e.thumbnailUrl != null)),
+                    : (e.launchUrl != null || e.thumbnailUrl != null)),
           )
           .toList(growable: false);
       if (sanitized.isEmpty) {
@@ -324,9 +369,19 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       final ordered = config.direction == SlideshowDirection.forward
           ? sorted
           : sorted.reversed.toList(growable: false);
+      if (ordered.length < 2) {
+        throw StateError(
+          'No additional APOD entries are available in that direction.',
+        );
+      }
 
       ref.read(slideshowEntriesProvider.notifier).state = ordered;
       ref.read(currentEntryProvider.notifier).state = AsyncData(ordered.first);
+      unawaited(
+        ref
+            .read(cacheServiceProvider)
+            .warmEntry(ordered.first, reason: 'slideshow_start'),
+      );
 
       if ((requestedSlides > _maxSlideshowItems ||
               effectiveSlideCount < requestedSlides) &&
@@ -364,10 +419,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
 
   Future<SlideshowLaunchConfig?> _pickSlideshowConfig(
-    BuildContext context,
-  ) async {
+    BuildContext context, {
+    required DateTime latestAvailableDate,
+  }) async {
     final intervalSeconds = ref.read(slideshowIntervalProvider);
-    DateTime selectedDate = _maxApodDate;
+    DateTime selectedDate = latestAvailableDate;
     SlideshowDirection direction = SlideshowDirection.forward;
     double durationMinutes = 10;
 
@@ -398,7 +454,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                         final picked = await showDatePicker(
                           context: context,
                           firstDate: _firstApodDate,
-                          lastDate: _maxApodDate,
+                          lastDate: latestAvailableDate,
                           initialDate: selectedDate,
                         );
                         if (picked != null) {
@@ -472,17 +528,85 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     );
   }
 
+  Future<DateTime> _resolveLatestAvailableDate(String apiKey) async {
+    try {
+      final latest = await ref.read(nasaApiServiceProvider).fetchToday(apiKey);
+      return DateTime(latest.date.year, latest.date.month, latest.date.day);
+    } catch (_) {
+      return _maxApodDate;
+    }
+  }
+
+  bool _isSameDay(DateTime a, DateTime b) =>
+      a.year == b.year && a.month == b.month && a.day == b.day;
+
   Future<void> _load(Future<ApodEntry> Function() loader) async {
     ref.read(currentEntryProvider.notifier).state = const AsyncLoading();
     try {
       final entry = await loader();
       ref.read(currentEntryProvider.notifier).state = AsyncData(entry);
+      unawaited(
+        ref.read(cacheServiceProvider).warmEntry(entry, reason: 'home'),
+      );
     } catch (e) {
       ref.read(currentEntryProvider.notifier).state = AsyncError(
         e,
         StackTrace.current,
       );
     }
+  }
+
+  Future<void> _setCurrentAsWallpaper(
+    BuildContext context,
+    ApodEntry entry,
+  ) async {
+    final imageUrl = entry.bestImageUrl;
+    if (imageUrl == null) return;
+
+    WallpaperFit style = WallpaperFit.fill;
+    if (Platform.isWindows) {
+      final picked = await _pickWindowsWallpaperStyle(context);
+      if (picked == null) return;
+      style = picked;
+    }
+
+    final file = await ref
+        .read(cacheServiceProvider)
+        .imageCache
+        .getSingleFile(imageUrl);
+    final msg = await ref
+        .read(wallpaperServiceProvider)
+        .setImageWallpaper(file.path, style: style);
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  Future<WallpaperFit?> _pickWindowsWallpaperStyle(BuildContext context) {
+    return showModalBottomSheet<WallpaperFit>(
+      context: context,
+      builder: (context) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const ListTile(title: Text('Wallpaper Style')),
+              ListTile(
+                title: const Text('Fill'),
+                onTap: () => Navigator.pop(context, WallpaperFit.fill),
+              ),
+              ListTile(
+                title: const Text('Stretch'),
+                onTap: () => Navigator.pop(context, WallpaperFit.stretch),
+              ),
+              ListTile(
+                title: const Text('Fit'),
+                onTap: () => Navigator.pop(context, WallpaperFit.fit),
+              ),
+            ],
+          ),
+        );
+      },
+    );
   }
 
   Widget _actionChip(

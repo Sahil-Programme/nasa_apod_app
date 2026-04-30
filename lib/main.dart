@@ -2,10 +2,10 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../providers/app_providers.dart';
-import '../screens/home_screen.dart';
-import '../screens/onboarding_api_key_screen.dart';
-import '../ui/app_theme.dart';
+import 'providers/app_providers.dart';
+import 'screens/home_screen.dart';
+import 'screens/onboarding_api_key_screen.dart';
+import 'ui/app_theme.dart';
 
 /// Application entrypoint.
 ///

@@ -53,9 +53,9 @@ class SettingsScreen extends ConsumerWidget {
                   Text('Slideshow Interval: ${interval}s'),
                   Slider(
                     value: interval.toDouble(),
-                    min: 3,
+                    min: 1,
                     max: 20,
-                    divisions: 17,
+                    divisions: 19,
                     onChanged: (v) =>
                         ref.read(slideshowIntervalProvider.notifier).state = v
                             .round(),
@@ -64,9 +64,9 @@ class SettingsScreen extends ConsumerWidget {
                   Text('Pre-cache Window: $precache item(s)'),
                   Slider(
                     value: precache.toDouble(),
-                    min: 1,
-                    max: 8,
-                    divisions: 7,
+                    min: 5,
+                    max: 15,
+                    divisions: 10,
                     onChanged: (v) =>
                         ref.read(precacheWindowProvider.notifier).state = v
                             .round(),

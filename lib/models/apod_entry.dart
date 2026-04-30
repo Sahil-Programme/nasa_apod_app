@@ -25,14 +25,73 @@ class ApodEntry {
   final String? thumbnailUrl;
   final String? copyright;
 
+  static const Set<String> _imageExt = {
+    '.jpg',
+    '.jpeg',
+    '.png',
+    '.gif',
+    '.webp',
+    '.bmp',
+    '.tif',
+    '.tiff',
+    '.avif',
+  };
+  static const Set<String> _videoExt = {
+    '.mp4',
+    '.mov',
+    '.m4v',
+    '.webm',
+    '.mkv',
+    '.avi',
+  };
+  static const Set<String> _audioExt = {
+    '.mp3',
+    '.wav',
+    '.ogg',
+    '.m4a',
+    '.flac',
+    '.aac',
+  };
+
+  String get normalizedMediaType => mediaType.trim().toLowerCase();
+
   /// True when APOD payload is image-based media.
-  bool get isImage => mediaType == 'image';
+  bool get isImage => normalizedMediaType == 'image';
 
   /// True when APOD payload is video-based media.
-  bool get isVideo => mediaType == 'video';
+  bool get isVideo => normalizedMediaType == 'video';
+
+  /// True when APOD payload is explicitly audio-based media.
+  bool get isAudio => normalizedMediaType == 'audio';
 
   /// Best-effort display image URL preference.
   String? get bestImageUrl => hdurl ?? url ?? thumbnailUrl;
+
+  String? get primaryUrl => url ?? hdurl ?? thumbnailUrl;
+
+  String? get launchUrl => primaryUrl;
+
+  bool get looksLikeImage =>
+      _looksLike(url, _imageExt) ||
+      _looksLike(hdurl, _imageExt) ||
+      _looksLike(thumbnailUrl, _imageExt);
+
+  bool get looksLikeVideo =>
+      _looksLike(url, _videoExt) ||
+      _looksLike(hdurl, _videoExt) ||
+      _looksLikeYouTube(url);
+
+  bool get looksLikeAudio =>
+      _looksLike(url, _audioExt) || _looksLike(hdurl, _audioExt);
+
+  bool get shouldRenderAsImage => isImage || (!isVideo && looksLikeImage);
+
+  bool get shouldRenderAsVideo =>
+      isVideo || (!shouldRenderAsImage && looksLikeVideo);
+
+  bool get shouldRenderAsAudio =>
+      isAudio ||
+      (!shouldRenderAsImage && !shouldRenderAsVideo && looksLikeAudio);
 
   factory ApodEntry.fromJson(Map<String, dynamic> json) {
     return ApodEntry(
@@ -64,4 +123,23 @@ class ApodEntry {
   /// Helper for persisting lists to JSON storage.
   static String encodeList(List<ApodEntry> list) =>
       jsonEncode(list.map((e) => e.toJson()).toList());
+
+  static bool _looksLike(String? candidate, Set<String> extensions) {
+    if (candidate == null || candidate.trim().isEmpty) return false;
+    final uri = Uri.tryParse(candidate);
+    if (uri == null) return false;
+    final p = uri.path.toLowerCase();
+    for (final ext in extensions) {
+      if (p.endsWith(ext)) return true;
+    }
+    return false;
+  }
+
+  static bool _looksLikeYouTube(String? candidate) {
+    if (candidate == null || candidate.trim().isEmpty) return false;
+    final uri = Uri.tryParse(candidate);
+    if (uri == null) return false;
+    final host = uri.host.toLowerCase();
+    return host.contains('youtube.com') || host.contains('youtu.be');
+  }
 }

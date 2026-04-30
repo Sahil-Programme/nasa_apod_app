@@ -1,8 +1,82 @@
 #include "flutter_window.h"
 
 #include <optional>
+#include <string>
+#include <vector>
+#include <windows.h>
+
+#include <flutter/standard_method_codec.h>
 
 #include "flutter/generated_plugin_registrant.h"
+
+namespace {
+
+bool Utf16FromUtf8(const std::string& utf8, std::wstring* out) {
+  if (utf8.empty() || out == nullptr) {
+    return false;
+  }
+  const int utf16_length = MultiByteToWideChar(
+      CP_UTF8, MB_ERR_INVALID_CHARS, utf8.c_str(), -1, nullptr, 0);
+  if (utf16_length <= 0) {
+    return false;
+  }
+
+  std::vector<wchar_t> buffer(static_cast<size_t>(utf16_length));
+  if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.c_str(), -1,
+                          buffer.data(), utf16_length) == 0) {
+    return false;
+  }
+
+  *out = std::wstring(buffer.data());
+  return true;
+}
+
+bool ApplyWindowsWallpaperStyle(const std::string& style) {
+  const wchar_t* wallpaper_style = L"10";
+  const wchar_t* tile_wallpaper = L"0";
+  if (style == "stretch") {
+    wallpaper_style = L"2";
+  } else if (style == "fit") {
+    wallpaper_style = L"6";
+  } else if (style != "fill") {
+    return false;
+  }
+
+  HKEY key;
+  if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Control Panel\\Desktop", 0,
+                    KEY_SET_VALUE, &key) != ERROR_SUCCESS) {
+    return false;
+  }
+
+  const auto ok_style = RegSetValueExW(
+      key, L"WallpaperStyle", 0, REG_SZ,
+      reinterpret_cast<const BYTE*>(wallpaper_style),
+      static_cast<DWORD>((wcslen(wallpaper_style) + 1) * sizeof(wchar_t)));
+  const auto ok_tile = RegSetValueExW(
+      key, L"TileWallpaper", 0, REG_SZ,
+      reinterpret_cast<const BYTE*>(tile_wallpaper),
+      static_cast<DWORD>((wcslen(tile_wallpaper) + 1) * sizeof(wchar_t)));
+  RegCloseKey(key);
+  return ok_style == ERROR_SUCCESS && ok_tile == ERROR_SUCCESS;
+}
+
+bool SetWindowsWallpaper(const std::string& path, const std::string& style) {
+  std::wstring utf16_path;
+  if (!Utf16FromUtf8(path, &utf16_path) || utf16_path.empty()) {
+    return false;
+  }
+  if (GetFileAttributesW(utf16_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    return false;
+  }
+  if (!ApplyWindowsWallpaperStyle(style)) {
+    return false;
+  }
+  return SystemParametersInfoW(
+      SPI_SETDESKWALLPAPER, 0, reinterpret_cast<PVOID>(utf16_path.data()),
+      SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+}
+
+}  // namespace
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
     : project_(project) {}
@@ -25,6 +99,7 @@ bool FlutterWindow::OnCreate() {
     return false;
   }
   RegisterPlugins(flutter_controller_->engine());
+  RegisterWallpaperChannel();
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
@@ -39,7 +114,49 @@ bool FlutterWindow::OnCreate() {
   return true;
 }
 
+void FlutterWindow::RegisterWallpaperChannel() {
+  wallpaper_channel_ =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          flutter_controller_->engine()->messenger(), "nasa_apod_app/wallpaper",
+          &flutter::StandardMethodCodec::GetInstance());
+
+  wallpaper_channel_->SetMethodCallHandler(
+      [](const flutter::MethodCall<flutter::EncodableValue>& method_call,
+         std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+             result) {
+        if (method_call.method_name() != "setWallpaper") {
+          result->NotImplemented();
+          return;
+        }
+
+        const auto* args =
+            std::get_if<flutter::EncodableMap>(method_call.arguments());
+        if (args == nullptr) {
+          result->Success(flutter::EncodableValue(false));
+          return;
+        }
+
+        const auto path_it = args->find(flutter::EncodableValue("path"));
+        const auto style_it = args->find(flutter::EncodableValue("style"));
+        if (path_it == args->end() || style_it == args->end()) {
+          result->Success(flutter::EncodableValue(false));
+          return;
+        }
+
+        const auto* path = std::get_if<std::string>(&path_it->second);
+        const auto* style = std::get_if<std::string>(&style_it->second);
+        if (path == nullptr || style == nullptr) {
+          result->Success(flutter::EncodableValue(false));
+          return;
+        }
+
+        const bool ok = SetWindowsWallpaper(*path, *style);
+        result->Success(flutter::EncodableValue(ok));
+      });
+}
+
 void FlutterWindow::OnDestroy() {
+  wallpaper_channel_ = nullptr;
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
   }

@@ -77,11 +77,19 @@ class ApodCard extends StatelessWidget {
 
   /// Draws image media or a video thumbnail with "Open Video" CTA.
   Widget _buildMedia(BuildContext context) {
-    if (entry.isImage && entry.bestImageUrl != null) {
+    if (entry.shouldRenderAsImage && entry.bestImageUrl != null) {
       return CachedNetworkImage(
         imageUrl: entry.bestImageUrl!,
         fit: BoxFit.cover,
-        placeholder: (_, _) => const Center(child: CircularProgressIndicator()),
+        placeholder: (_, _) => const ColoredBox(
+          color: Color(0xFF0E1A2F),
+          child: Center(
+            child: Text(
+              'Loading image...',
+              style: TextStyle(color: Colors.white70),
+            ),
+          ),
+        ),
         errorWidget: (_, _, _) =>
             const Center(child: Icon(Icons.broken_image_outlined)),
       );
@@ -103,11 +111,15 @@ class ApodCard extends StatelessWidget {
         Container(color: Colors.black.withValues(alpha: 0.32)),
         Center(
           child: ElevatedButton.icon(
-            onPressed: entry.url == null
+            onPressed: entry.launchUrl == null
                 ? null
-                : () => launchUrl(Uri.parse(entry.url!)),
-            icon: const Icon(Icons.play_circle_fill),
-            label: const Text('Open Video'),
+                : () => launchUrl(Uri.parse(entry.launchUrl!)),
+            icon: Icon(
+              entry.shouldRenderAsAudio ? Icons.graphic_eq : Icons.open_in_new,
+            ),
+            label: Text(
+              entry.shouldRenderAsAudio ? 'Open Audio' : 'Open Media',
+            ),
           ),
         ),
       ],

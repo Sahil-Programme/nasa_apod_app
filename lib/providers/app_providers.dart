@@ -27,7 +27,7 @@ final apiKeyProvider = StateProvider<String?>((_) => null);
 final slideshowIntervalProvider = StateProvider<int>((_) => 8);
 
 /// Number of upcoming items to prefetch for smooth slideshow playback.
-final precacheWindowProvider = StateProvider<int>((_) => 4);
+final precacheWindowProvider = StateProvider<int>((_) => 5);
 
 /// Screen state providers.
 /// Current APOD entry visible on the home screen.

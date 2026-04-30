@@ -1,15 +1,18 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math';
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:http/http.dart' as http;
 import 'package:video_player/video_player.dart';
 import 'package:youtube_player_iframe/youtube_player_iframe.dart';
 
 import '../models/apod_entry.dart';
 import '../models/slideshow_config.dart';
 import '../providers/app_providers.dart';
+import '../services/wallpaper_service.dart';
 import '../ui/app_theme.dart';
 import '../ui/cosmic_scaffold.dart';
 
@@ -37,6 +40,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   Timer? _controlsTimer;
   late final DateTime _startedAt;
   bool _controlsVisible = true;
+  bool _initialVisualReady = false;
   DateTime _lastPointerWake = DateTime.fromMillisecondsSinceEpoch(0);
 
   VideoPlayerController? _videoController;
@@ -45,7 +49,9 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   StreamSubscription<YoutubePlayerValue>? _youtubeSubscription;
   bool _awaitingVideoCompletion = false;
   String? _activeSlideKey;
-  String? _videoError;
+  String? _videoStateNote;
+  final Map<String, String?> _resolvedLaunchPreview = <String, String?>{};
+  final Set<String> _previewResolveInFlight = <String>{};
 
   static const _controlsHideDelay = Duration(seconds: 4);
   static const _pointerWakeDebounce = Duration(milliseconds: 250);
@@ -55,9 +61,56 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     super.initState();
     _startedAt = DateTime.now();
     _showControlsTemporarily();
-    _warmInitialCache();
+    unawaited(_bootstrapSlideshow());
+  }
+
+  Future<void> _bootstrapSlideshow() async {
+    final items = ref.read(slideshowEntriesProvider);
+    if (items.isEmpty) {
+      if (mounted) {
+        setState(() => _initialVisualReady = true);
+      }
+      return;
+    }
+
+    await _prepareInitialVisual(items.first);
+    if (!mounted) return;
+
+    setState(() => _initialVisualReady = true);
     _activateSlideForIndex(0);
     _tick();
+    unawaited(_syncSlidingCacheForIndex(0, reason: 'bootstrap'));
+  }
+
+  Future<void> _prepareInitialVisual(ApodEntry entry) async {
+    final previewUrl = _previewUrlForCaching(entry);
+    if (previewUrl == null) return;
+    final cache = ref.read(cacheServiceProvider).imageCache;
+    final cached = await cache.getFileFromCache(previewUrl);
+    if (cached != null) return;
+    // Kick off first-visual caching in background; do not block slideshow boot.
+    unawaited(cache.downloadFile(previewUrl));
+  }
+
+  Future<void> _syncSlidingCacheForIndex(
+    int index, {
+    required String reason,
+  }) async {
+    final items = ref.read(slideshowEntriesProvider);
+    if (items.isEmpty) return;
+    final window = ref.read(precacheWindowProvider).clamp(5, 15);
+    final start = max(0, index - window);
+    final end = min(items.length - 1, index + window);
+    final urls = <String>{};
+    for (var idx = start; idx <= end; idx++) {
+      final preview = _previewUrlForCaching(items[idx]);
+      if (preview != null && preview.trim().isNotEmpty) {
+        urls.add(preview);
+      }
+    }
+    await ref
+        .read(cacheServiceProvider)
+        .syncSlideshowWindowUrls(urls, reason: '$reason:idx=$index');
   }
 
   /// Starts or refreshes the periodic frame-advance loop.
@@ -79,26 +132,6 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
 
       _advanceToNext();
     });
-  }
-
-  Future<void> _warmInitialCache() async {
-    final items = ref.read(slideshowEntriesProvider);
-    if (items.isEmpty) return;
-    final cache = ref.read(cacheServiceProvider).imageCache;
-    final warmCount = min(items.length, 20);
-
-    for (var idx = 0; idx < warmCount; idx++) {
-      final entry = items[idx];
-      final url = entry.isImage ? entry.bestImageUrl : entry.thumbnailUrl;
-      if (url != null) {
-        cache.downloadFile(url).ignore();
-      }
-    }
-  }
-
-  void _prefetchUpcoming(List<ApodEntry> items, int index) {
-    final window = max(ref.read(precacheWindowProvider), 16);
-    ref.read(cacheServiceProvider).precacheUpcoming(items, index, window);
   }
 
   void _showControlsTemporarily() {
@@ -132,7 +165,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     final safe = index.clamp(0, items.length - 1);
     setState(() => i = safe);
     _activateSlideForIndex(safe);
-    _prefetchUpcoming(items, safe);
+    unawaited(_syncSlidingCacheForIndex(safe, reason: 'step'));
   }
 
   void _activateSlideForIndex(int index) {
@@ -140,13 +173,13 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     if (items.isEmpty) return;
     final entry = items[index];
     final key =
-        '${entry.date.toIso8601String()}|${entry.mediaType}|${entry.url}';
+        '${entry.date.toIso8601String()}|${entry.mediaType}|${entry.url}|${entry.thumbnailUrl}';
     if (_activeSlideKey == key) return;
     _activeSlideKey = key;
-    _videoError = null;
-    _disposeSlideMedia();
+    _videoStateNote = null;
+    unawaited(_disposeSlideMedia());
 
-    if (!entry.isVideo) {
+    if (!entry.shouldRenderAsVideo) {
       _awaitingVideoCompletion = false;
       return;
     }
@@ -155,9 +188,10 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   }
 
   Future<void> _startVideoSlidePlayback(ApodEntry entry) async {
-    final url = entry.url;
+    final url = entry.launchUrl;
     if (url == null || url.trim().isEmpty) {
       _awaitingVideoCompletion = false;
+      _videoStateNote = 'Video URL unavailable. Showing preview.';
       return;
     }
 
@@ -194,7 +228,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     final uri = Uri.tryParse(url);
     if (uri == null) {
       _awaitingVideoCompletion = false;
-      _videoError = 'Unsupported video URL';
+      _videoStateNote = 'Unsupported video URL. Showing preview.';
       return;
     }
 
@@ -221,7 +255,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
       if (mounted) setState(() {});
     } catch (_) {
       _awaitingVideoCompletion = false;
-      _videoError = 'Unable to autoplay this video source.';
+      _videoStateNote = 'Inline playback unavailable. Showing preview.';
       if (mounted) setState(() {});
     }
   }
@@ -262,7 +296,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   void dispose() {
     t?.cancel();
     _controlsTimer?.cancel();
-    _disposeSlideMedia();
+    unawaited(_disposeSlideMedia());
     super.dispose();
   }
 
@@ -278,6 +312,15 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     if (items.isEmpty) {
       return const CosmicScaffold(
         child: Center(child: Text('No slideshow items')),
+      );
+    }
+
+    if (!_initialVisualReady) {
+      return CosmicScaffold(
+        child: _spaceLoadingScreen(
+          context,
+          message: 'Preparing the next cosmic view...',
+        ),
       );
     }
 
@@ -297,14 +340,14 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
               Positioned.fill(
                 child: AnimatedSwitcher(
                   duration: const Duration(milliseconds: 650),
-                  child: e.isImage ? _buildImageSlide(e) : _buildVideoSlide(e),
+                  child: _buildSlideContent(e),
                 ),
               ),
               Positioned(
                 right: 14,
                 bottom: _controlsVisible ? 86 : 14,
                 child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 480),
+                  constraints: const BoxConstraints(maxWidth: 520),
                   child: Container(
                     padding: const EdgeInsets.symmetric(
                       horizontal: 10,
@@ -318,7 +361,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
                       ),
                     ),
                     child: Text(
-                      e.title,
+                      '${e.date.toIso8601String().split('T').first} • ${e.title}',
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: Theme.of(context).textTheme.bodyMedium?.copyWith(
@@ -387,6 +430,15 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
                         },
                         icon: const Icon(Icons.skip_next),
                       ),
+                      if (e.shouldRenderAsImage && e.bestImageUrl != null)
+                        IconButton(
+                          tooltip: 'Set wallpaper',
+                          onPressed: () async {
+                            await _setCurrentSlideAsWallpaper(context, e);
+                            _showControlsTemporarily();
+                          },
+                          icon: const Icon(Icons.wallpaper),
+                        ),
                       const SizedBox(width: 8),
                       Expanded(
                         child: Text(
@@ -407,19 +459,30 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     );
   }
 
+  Widget _buildSlideContent(ApodEntry entry) {
+    if (entry.shouldRenderAsImage) return _buildImageSlide(entry);
+    if (entry.shouldRenderAsVideo) return _buildVideoSlide(entry);
+    if (entry.shouldRenderAsAudio) return _buildAudioSlide(entry);
+    return _buildUnknownSlide(entry);
+  }
+
   Widget _buildImageSlide(ApodEntry entry) {
+    final imageUrl = entry.bestImageUrl;
+    if (imageUrl == null || imageUrl.trim().isEmpty) {
+      return _spaceLoadingScreen(
+        context,
+        message: 'Image unavailable for this entry.',
+      );
+    }
+
     return CachedNetworkImage(
       key: ValueKey('img_${entry.date.toIso8601String()}'),
-      imageUrl: entry.bestImageUrl ?? '',
+      imageUrl: imageUrl,
       fit: BoxFit.cover,
-      placeholder: (_, _) => const ColoredBox(
-        color: Color(0xFF0E1A2F),
-        child: Center(child: CircularProgressIndicator()),
-      ),
-      errorWidget: (_, _, _) => const ColoredBox(
-        color: Color(0xFF0E1A2F),
-        child: Center(child: Icon(Icons.broken_image_outlined)),
-      ),
+      placeholder: (_, _) =>
+          _spaceLoadingScreen(context, message: 'Loading image...'),
+      errorWidget: (_, _, _) =>
+          _spaceLoadingScreen(context, message: 'Unable to render this image.'),
     );
   }
 
@@ -453,14 +516,49 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
           ),
         );
       }
-      return const ColoredBox(
-        color: Color(0xFF050B18),
-        child: Center(child: CircularProgressIndicator()),
-      );
+      return _spaceLoadingScreen(context, message: 'Preparing video...');
     }
 
+    return _buildPreviewFallback(
+      entry,
+      message: _videoStateNote ?? 'Video preview',
+      noPreviewMessage: 'No preview available for this video.',
+      keyPrefix: 'vf',
+      icon: Icons.ondemand_video,
+    );
+  }
+
+  Widget _buildAudioSlide(ApodEntry entry) {
+    return _buildPreviewFallback(
+      entry,
+      message: 'Audio entry. Open in browser for playback.',
+      noPreviewMessage: 'No preview available for this audio entry.',
+      keyPrefix: 'af',
+      icon: Icons.graphic_eq,
+    );
+  }
+
+  Widget _buildUnknownSlide(ApodEntry entry) {
+    return _buildPreviewFallback(
+      entry,
+      message: 'Unsupported media type: ${entry.mediaType}.',
+      noPreviewMessage: 'No preview available for this media.',
+      keyPrefix: 'uf',
+      icon: Icons.auto_awesome_mosaic,
+    );
+  }
+
+  Widget _buildPreviewFallback(
+    ApodEntry entry, {
+    required String message,
+    required String noPreviewMessage,
+    required String keyPrefix,
+    required IconData icon,
+  }) {
+    unawaited(_ensureDynamicPreviewResolved(entry));
+    final previewUrl = _previewUrlForCaching(entry);
     return Container(
-      key: ValueKey('vf_${entry.date.toIso8601String()}'),
+      key: ValueKey('${keyPrefix}_${entry.date.toIso8601String()}'),
       color: const Color(0xFF0E1A2F),
       child: Center(
         child: Padding(
@@ -468,21 +566,238 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              if (entry.thumbnailUrl != null)
+              if (previewUrl != null)
                 ClipRRect(
                   borderRadius: BorderRadius.circular(16),
-                  child: Image.network(entry.thumbnailUrl!, height: 200),
-                ),
+                  child: CachedNetworkImage(
+                    imageUrl: previewUrl,
+                    height: 220,
+                    fit: BoxFit.cover,
+                    placeholder: (_, _) =>
+                        const SizedBox(height: 220, width: 360),
+                    errorWidget: (_, _, _) =>
+                        const SizedBox(height: 220, width: 360),
+                  ),
+                )
+              else
+                Icon(icon, size: 52, color: AppTheme.accentSoft),
               const SizedBox(height: 14),
               Text(
-                _videoError ?? 'Video source could not autoplay inline.',
+                message,
                 textAlign: TextAlign.center,
                 style: const TextStyle(color: Colors.white70),
               ),
+              if (previewUrl == null) ...[
+                const SizedBox(height: 8),
+                Text(
+                  noPreviewMessage,
+                  style: const TextStyle(color: Colors.white54),
+                ),
+              ],
             ],
           ),
         ),
       ),
+    );
+  }
+
+  String? _previewUrlForCaching(ApodEntry entry) {
+    if (entry.shouldRenderAsImage && entry.bestImageUrl != null) {
+      return entry.bestImageUrl;
+    }
+    if (entry.thumbnailUrl != null && entry.thumbnailUrl!.trim().isNotEmpty) {
+      return entry.thumbnailUrl;
+    }
+    final launch = entry.launchUrl;
+    if (launch == null || launch.trim().isEmpty) return null;
+    final resolved = _resolvedLaunchPreview[launch];
+    if (resolved != null && resolved.trim().isNotEmpty) return resolved;
+    final providerPreview = _providerPreviewFromLaunch(launch);
+    if (providerPreview != null) return providerPreview;
+    final youtubeId = YoutubePlayerController.convertUrlToId(launch);
+    if (youtubeId != null) {
+      return 'https://img.youtube.com/vi/$youtubeId/hqdefault.jpg';
+    }
+    return null;
+  }
+
+  String? _providerPreviewFromLaunch(String launch) {
+    final uri = Uri.tryParse(launch);
+    if (uri == null) return null;
+    final host = uri.host.toLowerCase();
+    final path = uri.path.toLowerCase();
+    if (path.endsWith('.jpg') ||
+        path.endsWith('.jpeg') ||
+        path.endsWith('.png') ||
+        path.endsWith('.gif') ||
+        path.endsWith('.webp')) {
+      return launch;
+    }
+    if (host.contains('vimeo.com')) {
+      final match = RegExp(r'vimeo\.com/(?:video/)?(\d+)').firstMatch(launch);
+      final id = match?.group(1);
+      if (id != null && id.isNotEmpty) {
+        return 'https://vumbnail.com/$id.jpg';
+      }
+    }
+    if (host.contains('dailymotion.com')) {
+      final match = RegExp(r'/video/([A-Za-z0-9]+)').firstMatch(path);
+      final id = match?.group(1);
+      if (id != null && id.isNotEmpty) {
+        return 'https://www.dailymotion.com/thumbnail/video/$id';
+      }
+    }
+    return null;
+  }
+
+  Future<void> _ensureDynamicPreviewResolved(ApodEntry entry) async {
+    final launch = entry.launchUrl;
+    if (launch == null || launch.trim().isEmpty) return;
+    if (_previewResolveInFlight.contains(launch)) return;
+    if (_previewUrlForCaching(entry) != null) return;
+
+    _previewResolveInFlight.add(launch);
+    String? discovered;
+    try {
+      final uri = Uri.tryParse(launch);
+      if (uri != null) {
+        final response = await http
+            .get(uri, headers: const {'User-Agent': 'nasa-apod-explorer/1.0'})
+            .timeout(const Duration(seconds: 5));
+        if (response.statusCode >= 200 &&
+            response.statusCode < 300 &&
+            response.body.isNotEmpty) {
+          discovered = _extractMetaPreviewImage(response.body, uri);
+        }
+      }
+    } catch (_) {
+      // Keep graceful fallback when preview resolution fails.
+    } finally {
+      _previewResolveInFlight.remove(launch);
+    }
+
+    _resolvedLaunchPreview[launch] = discovered;
+    if (!mounted) return;
+    setState(() {});
+    if (discovered != null && discovered.trim().isNotEmpty) {
+      unawaited(_syncSlidingCacheForIndex(i, reason: 'preview_resolved'));
+    }
+  }
+
+  String? _extractMetaPreviewImage(String html, Uri base) {
+    final patterns = <RegExp>[
+      RegExp(
+        r'''<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']''',
+        caseSensitive: false,
+      ),
+      RegExp(
+        r'''<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']''',
+        caseSensitive: false,
+      ),
+      RegExp(
+        r'''<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']''',
+        caseSensitive: false,
+      ),
+      RegExp(
+        r'''<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:image["']''',
+        caseSensitive: false,
+      ),
+    ];
+    for (final pattern in patterns) {
+      final match = pattern.firstMatch(html);
+      final candidate = match?.group(1)?.trim();
+      if (candidate == null || candidate.isEmpty) continue;
+      final resolved = Uri.tryParse(candidate);
+      if (resolved == null) continue;
+      final absolute = resolved.hasScheme
+          ? resolved
+          : base.resolveUri(resolved);
+      return absolute.toString();
+    }
+    return null;
+  }
+
+  Widget _spaceLoadingScreen(BuildContext context, {required String message}) {
+    return Container(
+      decoration: const BoxDecoration(
+        gradient: RadialGradient(
+          center: Alignment(0.1, -0.3),
+          radius: 1.2,
+          colors: [Color(0xFF132040), Color(0xFF090F1E), Color(0xFF050912)],
+        ),
+      ),
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(
+              Icons.auto_awesome,
+              color: AppTheme.accentSoft,
+              size: 46,
+            ),
+            const SizedBox(height: 12),
+            Text(
+              message,
+              style: Theme.of(
+                context,
+              ).textTheme.bodyLarge?.copyWith(color: Colors.white70),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _setCurrentSlideAsWallpaper(
+    BuildContext context,
+    ApodEntry entry,
+  ) async {
+    final imageUrl = entry.bestImageUrl;
+    if (imageUrl == null) return;
+
+    var style = WallpaperFit.fill;
+    if (Platform.isWindows) {
+      final picked = await _pickWindowsWallpaperStyle(context);
+      if (picked == null) return;
+      style = picked;
+    }
+
+    final file = await ref
+        .read(cacheServiceProvider)
+        .imageCache
+        .getSingleFile(imageUrl);
+    final msg = await ref
+        .read(wallpaperServiceProvider)
+        .setImageWallpaper(file.path, style: style);
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  Future<WallpaperFit?> _pickWindowsWallpaperStyle(BuildContext context) {
+    return showModalBottomSheet<WallpaperFit>(
+      context: context,
+      builder: (context) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const ListTile(title: Text('Wallpaper Style')),
+              ListTile(
+                title: const Text('Fill'),
+                onTap: () => Navigator.pop(context, WallpaperFit.fill),
+              ),
+              ListTile(
+                title: const Text('Stretch'),
+                onTap: () => Navigator.pop(context, WallpaperFit.stretch),
+              ),
+              ListTile(
+                title: const Text('Fit'),
+                onTap: () => Navigator.pop(context, WallpaperFit.fit),
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 }

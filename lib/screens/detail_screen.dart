@@ -8,6 +8,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../models/apod_entry.dart';
 import '../providers/app_providers.dart';
+import '../services/wallpaper_service.dart';
 import '../ui/app_theme.dart';
 import '../ui/cosmic_scaffold.dart';
 
@@ -29,16 +30,8 @@ class DetailScreen extends ConsumerWidget {
             borderRadius: BorderRadius.circular(22),
             child: AspectRatio(
               aspectRatio: 16 / 10,
-              child: entry.isImage
-                  ? PhotoView(
-                      minScale: PhotoViewComputedScale.contained,
-                      imageProvider: CachedNetworkImageProvider(
-                        entry.bestImageUrl!,
-                      ),
-                      backgroundDecoration: const BoxDecoration(
-                        color: Colors.transparent,
-                      ),
-                    )
+              child: entry.shouldRenderAsImage
+                  ? _imageContent(context)
                   : _videoFallback(context),
             ),
           ),
@@ -81,19 +74,25 @@ class DetailScreen extends ConsumerWidget {
               ],
             ),
           ),
-          if (entry.isImage) ...[
+          if (entry.shouldRenderAsImage && entry.bestImageUrl != null) ...[
             const SizedBox(height: 14),
             SizedBox(
               width: double.infinity,
               child: ElevatedButton.icon(
                 onPressed: () async {
+                  var style = WallpaperFit.fill;
+                  if (Platform.isWindows) {
+                    final picked = await _pickWindowsWallpaperStyle(context);
+                    if (picked == null) return;
+                    style = picked;
+                  }
                   final file = await ref
                       .read(cacheServiceProvider)
                       .imageCache
                       .getSingleFile(entry.bestImageUrl!);
                   final msg = await ref
                       .read(wallpaperServiceProvider)
-                      .setImageWallpaper(file.path);
+                      .setImageWallpaper(file.path, style: style);
                   if (context.mounted) {
                     ScaffoldMessenger.of(
                       context,
@@ -114,8 +113,56 @@ class DetailScreen extends ConsumerWidget {
     );
   }
 
+  Widget _imageContent(BuildContext context) {
+    final imageUrl = entry.bestImageUrl;
+    if (imageUrl == null) {
+      return Container(
+        color: const Color(0xFF101A2E),
+        alignment: Alignment.center,
+        child: const Text(
+          'This APOD image is unavailable.',
+          style: TextStyle(color: Colors.white70),
+        ),
+      );
+    }
+    return PhotoView(
+      minScale: PhotoViewComputedScale.contained,
+      imageProvider: CachedNetworkImageProvider(imageUrl),
+      backgroundDecoration: const BoxDecoration(color: Colors.transparent),
+    );
+  }
+
+  Future<WallpaperFit?> _pickWindowsWallpaperStyle(BuildContext context) {
+    return showModalBottomSheet<WallpaperFit>(
+      context: context,
+      builder: (context) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const ListTile(title: Text('Wallpaper Style')),
+              ListTile(
+                title: const Text('Fill'),
+                onTap: () => Navigator.pop(context, WallpaperFit.fill),
+              ),
+              ListTile(
+                title: const Text('Stretch'),
+                onTap: () => Navigator.pop(context, WallpaperFit.stretch),
+              ),
+              ListTile(
+                title: const Text('Fit'),
+                onTap: () => Navigator.pop(context, WallpaperFit.fit),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
   Widget _videoFallback(BuildContext context) {
     // External player flow keeps video integration lightweight and robust.
+    final launch = entry.launchUrl;
     return Container(
       color: const Color(0xFF101A2E),
       child: Center(
@@ -129,8 +176,12 @@ class DetailScreen extends ConsumerWidget {
             ),
             const SizedBox(height: 10),
             ElevatedButton(
-              onPressed: () => launchUrl(Uri.parse(entry.url!)),
-              child: const Text('Open Video'),
+              onPressed: launch == null
+                  ? null
+                  : () => launchUrl(Uri.parse(launch)),
+              child: Text(
+                entry.shouldRenderAsAudio ? 'Open Audio' : 'Open Media',
+              ),
             ),
           ],
         ),

@@ -22,6 +22,12 @@ class _OnboardingApiKeyScreenState
   String? error;
 
   @override
+  void dispose() {
+    c.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     return CosmicScaffold(
       appBar: AppBar(title: const Text('NASA APOD Explorer')),

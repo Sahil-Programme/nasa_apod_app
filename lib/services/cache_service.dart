@@ -1,5 +1,4 @@
-import 'dart:convert';
-
+import 'package:flutter/foundation.dart';
 import 'package:flutter_cache_manager/flutter_cache_manager.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -11,32 +10,55 @@ import '../models/apod_entry.dart';
 class CacheService {
   static const _metaPrefix = 'apod_meta_';
   static const _tsPrefix = 'apod_ts_';
-  static const metadataTtlHours = 24;
 
   final CacheManager imageCache = DefaultCacheManager();
+  final Set<String> _managedSlideshowUrls = <String>{};
 
-  /// Reads cached metadata for a given APOD date key if still within TTL.
-  Future<ApodEntry?> getByDate(String dateKey) async {
-    final prefs = await SharedPreferences.getInstance();
-    final ts = prefs.getInt('$_tsPrefix$dateKey');
-    if (ts == null) return null;
+  String _mediaUrlForEntry(ApodEntry entry) => entry.shouldRenderAsImage
+      ? (entry.bestImageUrl ?? '')
+      : (entry.thumbnailUrl ?? '');
 
-    final age = DateTime.now().millisecondsSinceEpoch - ts;
-    if (age > const Duration(hours: metadataTtlHours).inMilliseconds) {
-      return null;
-    }
-
-    final raw = prefs.getString('$_metaPrefix$dateKey');
-    if (raw == null) return null;
-    return ApodEntry.fromJson(jsonDecode(raw) as Map<String, dynamic>);
+  void _log(String message) {
+    if (!kDebugMode) return;
+    final now = DateTime.now().toIso8601String();
+    debugPrint('[CACHE][$now] $message');
   }
 
-  /// Writes APOD metadata and freshness timestamp to local preferences.
-  Future<void> saveEntry(ApodEntry entry) async {
-    final prefs = await SharedPreferences.getInstance();
-    final key = entry.date.toIso8601String().split('T').first;
-    await prefs.setString('$_metaPrefix$key', jsonEncode(entry.toJson()));
-    await prefs.setInt('$_tsPrefix$key', DateTime.now().millisecondsSinceEpoch);
+  Future<void> _cacheUrl(String url, {required String reason}) async {
+    if (url.trim().isEmpty) return;
+    final cached = await imageCache.getFileFromCache(url);
+    if (cached != null) {
+      _log('HIT reason=$reason url=$url');
+      return;
+    }
+
+    _log('MISS reason=$reason url=$url');
+    try {
+      await imageCache.downloadFile(url);
+      _log('SAVED reason=$reason url=$url');
+    } catch (e) {
+      _log('ERROR reason=$reason url=$url error=$e');
+    }
+  }
+
+  Future<void> _purgeUrl(String url, {required String reason}) async {
+    if (url.trim().isEmpty) return;
+    try {
+      await imageCache.removeFile(url);
+      _log('PURGED reason=$reason url=$url');
+    } catch (e) {
+      _log('PURGE_ERROR reason=$reason url=$url error=$e');
+    }
+  }
+
+  /// Ensures current media (or video thumbnail) is cached and logs status in debug.
+  Future<void> warmEntry(ApodEntry entry, {String reason = 'entry'}) async {
+    final url = _mediaUrlForEntry(entry);
+    if (url.isEmpty) {
+      _log('SKIP reason=$reason date=${entry.date.toIso8601String()}');
+      return;
+    }
+    await _cacheUrl(url, reason: reason);
   }
 
   /// Clears all APOD metadata and disk-cached media assets.
@@ -52,23 +74,51 @@ class CacheService {
     }
 
     await imageCache.emptyCache();
+    _managedSlideshowUrls.clear();
   }
 
-  /// Preloads upcoming slideshow assets without blocking UI rendering.
+  /// Keeps a managed slideshow cache set in sync with the desired URL window.
+  Future<void> syncSlideshowWindowUrls(
+    Set<String> desiredUrls, {
+    String reason = 'slideshow_window',
+  }) async {
+    final desired = desiredUrls
+        .map((e) => e.trim())
+        .where((e) => e.isNotEmpty)
+        .toSet();
+    final add = desired.difference(_managedSlideshowUrls);
+    final purge = _managedSlideshowUrls.difference(desired);
+
+    _log(
+      'SYNC reason=$reason keep=${desired.length} add=${add.length} purge=${purge.length}',
+    );
+
+    for (final url in add) {
+      await _cacheUrl(url, reason: '$reason:add');
+    }
+    for (final url in purge) {
+      await _purgeUrl(url, reason: '$reason:purge');
+    }
+
+    _managedSlideshowUrls
+      ..clear()
+      ..addAll(desired);
+  }
+
+  /// Backward-compatible wrapper for older slideshow callsites.
   Future<void> precacheUpcoming(
     List<ApodEntry> items,
     int index,
     int window,
   ) async {
+    if (items.isEmpty) return;
+    final start = (index - window).clamp(0, items.length - 1);
     final end = (index + window).clamp(0, items.length - 1);
-    for (var i = index + 1; i <= end; i++) {
-      final e = items[i];
-      if (e.isImage && e.bestImageUrl != null) {
-        imageCache.downloadFile(e.bestImageUrl!).ignore();
-      } else if (e.thumbnailUrl != null) {
-        // For videos, cache only thumbnail assets, not full media.
-        imageCache.downloadFile(e.thumbnailUrl!).ignore();
-      }
+    final urls = <String>{};
+    for (var i = start; i <= end; i++) {
+      final url = _mediaUrlForEntry(items[i]);
+      if (url.isNotEmpty) urls.add(url);
     }
+    await syncSlideshowWindowUrls(urls, reason: 'legacy_window');
   }
 }
