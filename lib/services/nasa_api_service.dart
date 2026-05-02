@@ -4,6 +4,8 @@ import 'package:http/http.dart' as http;
 
 import '../models/apod_entry.dart';
 
+enum ApodDateSearchDirection { backward, forward, nearest }
+
 /// Typed API exception surfaced to UI for user-friendly handling.
 class NasaApiException implements Exception {
   const NasaApiException(this.message);
@@ -16,6 +18,7 @@ class NasaApiException implements Exception {
 /// NASA APOD REST client.
 class NasaApiService {
   static const _base = 'https://api.nasa.gov/planetary/apod';
+  static final DateTime firstApodDate = DateTime(1995, 6, 16);
 
   /// Validates credentials by issuing a minimal APOD request.
   Future<void> validateApiKey(String key) async {
@@ -28,6 +31,70 @@ class NasaApiService {
   /// Returns APOD for an explicit calendar day.
   Future<ApodEntry> fetchByDate(String key, DateTime date) async =>
       _fetchOne(key, {'date': _fmt(date)});
+
+  /// Resolves the nearest APOD to [target] using a directional search strategy.
+  Future<ApodEntry> fetchNearestAvailableByDate(
+    String key,
+    DateTime target, {
+    ApodDateSearchDirection direction = ApodDateSearchDirection.backward,
+    int maxSearchDays = 31,
+    DateTime? minDate,
+    DateTime? maxDate,
+  }) async {
+    final minAllowed = _stripTime(minDate ?? firstApodDate);
+    final maxAllowed = _stripTime(maxDate ?? DateTime.now().toUtc());
+    if (maxAllowed.isBefore(minAllowed)) {
+      throw const NasaApiException('Invalid APOD date window.');
+    }
+
+    var seed = _stripTime(target);
+    if (seed.isBefore(minAllowed)) seed = minAllowed;
+    if (seed.isAfter(maxAllowed)) seed = maxAllowed;
+
+    final candidates = <DateTime>[];
+    final seen = <String>{};
+    void push(DateTime d) {
+      if (d.isBefore(minAllowed) || d.isAfter(maxAllowed)) return;
+      final keyDate = _fmt(d);
+      if (seen.add(keyDate)) candidates.add(d);
+    }
+
+    switch (direction) {
+      case ApodDateSearchDirection.backward:
+        for (var offset = 0; offset <= maxSearchDays; offset++) {
+          push(seed.subtract(Duration(days: offset)));
+        }
+        break;
+      case ApodDateSearchDirection.forward:
+        for (var offset = 0; offset <= maxSearchDays; offset++) {
+          push(seed.add(Duration(days: offset)));
+        }
+        break;
+      case ApodDateSearchDirection.nearest:
+        push(seed);
+        for (var offset = 1; offset <= maxSearchDays; offset++) {
+          push(seed.subtract(Duration(days: offset)));
+          push(seed.add(Duration(days: offset)));
+        }
+        break;
+    }
+
+    Object? lastError;
+    for (final date in candidates) {
+      try {
+        return await fetchByDate(key, date);
+      } catch (e) {
+        lastError = e;
+      }
+    }
+
+    if (lastError is NasaApiException) {
+      throw lastError;
+    }
+    throw NasaApiException(
+      'No APOD entry was found within $maxSearchDays day(s) of ${_fmt(seed)}.',
+    );
+  }
 
   /// Fetches a random APOD entry via count=1 and unwraps the list payload.
   Future<ApodEntry> fetchRandom(String key) async {
@@ -103,4 +170,6 @@ class NasaApiService {
   }
 
   String _fmt(DateTime d) => d.toIso8601String().split('T').first;
+
+  DateTime _stripTime(DateTime d) => DateTime(d.year, d.month, d.day);
 }

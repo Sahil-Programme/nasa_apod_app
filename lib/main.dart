@@ -1,5 +1,10 @@
+import 'dart:async';
+import 'dart:io';
+import 'dart:math';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'providers/app_providers.dart';
@@ -13,6 +18,7 @@ import 'widgets/space_loading.dart';
 /// We keep bootstrap intentionally thin and delegate all state orchestration to
 /// Riverpod providers so startup logic stays testable and deterministic.
 void main() {
+  WidgetsFlutterBinding.ensureInitialized();
   final originalOnError = FlutterError.onError;
   FlutterError.onError = (details) {
     final message = details.exceptionAsString();
@@ -40,13 +46,20 @@ class NasaApodExplorerApp extends ConsumerStatefulWidget {
       _NasaApodExplorerAppState();
 }
 
-class _NasaApodExplorerAppState extends ConsumerState<NasaApodExplorerApp> {
+class _NasaApodExplorerAppState extends ConsumerState<NasaApodExplorerApp>
+    with WidgetsBindingObserver {
   bool _ready = false;
   static const _devApiKey = String.fromEnvironment('NASA_API_KEY');
+  bool? _landscapeOnly;
+
+  bool get _isMobilePlatform =>
+      !kIsWeb && (Platform.isAndroid || Platform.isIOS);
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    unawaited(_syncOrientationPolicy());
     // Read persisted key once during boot and publish it to app state.
     Future.microtask(() async {
       final storedKey = await ref.read(apiKeyServiceProvider).read();
@@ -55,6 +68,41 @@ class _NasaApodExplorerAppState extends ConsumerState<NasaApodExplorerApp> {
       ref.read(apiKeyProvider.notifier).state = key;
       setState(() => _ready = true);
     });
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeMetrics() {
+    unawaited(_syncOrientationPolicy());
+  }
+
+  Future<void> _syncOrientationPolicy() async {
+    if (!_isMobilePlatform) return;
+    final views = WidgetsBinding.instance.platformDispatcher.views;
+    if (views.isEmpty) return;
+    final display = views.first.display;
+    final shortestSide =
+        min(display.size.width, display.size.height) / display.devicePixelRatio;
+    final wantsLandscapeOnly = shortestSide >= 600;
+    if (_landscapeOnly == wantsLandscapeOnly) return;
+    _landscapeOnly = wantsLandscapeOnly;
+
+    if (wantsLandscapeOnly) {
+      await SystemChrome.setPreferredOrientations(const [
+        DeviceOrientation.landscapeLeft,
+        DeviceOrientation.landscapeRight,
+      ]);
+      return;
+    }
+    await SystemChrome.setPreferredOrientations(const [
+      DeviceOrientation.portraitUp,
+      DeviceOrientation.portraitDown,
+    ]);
   }
 
   @override

@@ -1,4 +1,4 @@
-package com.example.nasa_apod_app
+package com.iamsahilyadav.stellarlens
 
 import io.flutter.embedding.android.FlutterActivity
 

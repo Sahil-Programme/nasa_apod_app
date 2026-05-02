@@ -10,6 +10,8 @@
 #include "flutter/generated_plugin_registrant.h"
 
 namespace {
+constexpr int kMinWindowWidth = 1280;
+constexpr int kMinWindowHeight = 720;
 
 bool Utf16FromUtf8(const std::string& utf8, std::wstring* out) {
   if (utf8.empty() || out == nullptr) {
@@ -179,6 +181,16 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
   }
 
   switch (message) {
+    case WM_GETMINMAXINFO: {
+      auto* min_max_info = reinterpret_cast<MINMAXINFO*>(lparam);
+      UINT dpi = GetDpiForWindow(hwnd);
+      if (dpi == 0) {
+        dpi = 96;
+      }
+      min_max_info->ptMinTrackSize.x = MulDiv(kMinWindowWidth, dpi, 96);
+      min_max_info->ptMinTrackSize.y = MulDiv(kMinWindowHeight, dpi, 96);
+      return 0;
+    }
     case WM_FONTCHANGE:
       flutter_controller_->engine()->ReloadSystemFonts();
       break;

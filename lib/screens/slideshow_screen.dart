@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:http/http.dart' as http;
 import 'package:video_player/video_player.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:youtube_player_iframe/youtube_player_iframe.dart';
 
 import '../models/apod_entry.dart';
@@ -75,6 +76,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   void initState() {
     super.initState();
     _startedAt = DateTime.now();
+    unawaited(WakelockPlus.enable());
     _showControlsTemporarily();
     unawaited(_bootstrapSlideshow());
   }
@@ -347,6 +349,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   void dispose() {
     t?.cancel();
     _controlsTimer?.cancel();
+    unawaited(WakelockPlus.disable());
     unawaited(_disposeSlideMedia());
     super.dispose();
   }
@@ -411,31 +414,45 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
                   ),
                 ),
               Positioned(
-                right: 14,
+                left: 12,
+                right: 12,
                 bottom: _controlsVisible ? 86 : 14,
-                child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 520),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 10,
-                      vertical: 7,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 7,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.5),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: AppTheme.accent.withValues(alpha: 0.24),
                     ),
-                    decoration: BoxDecoration(
-                      color: Colors.black.withValues(alpha: 0.5),
-                      borderRadius: BorderRadius.circular(12),
-                      border: Border.all(
-                        color: AppTheme.accent.withValues(alpha: 0.24),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        e.date.toIso8601String().split('T').first,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: AppTheme.accentSoft,
+                          fontWeight: FontWeight.w700,
+                        ),
                       ),
-                    ),
-                    child: Text(
-                      '${e.date.toIso8601String().split('T').first} • ${e.title}',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                        color: Colors.white,
-                        fontWeight: FontWeight.w600,
+                      const SizedBox(height: 2),
+                      Text(
+                        e.title,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          color: Colors.white,
+                          fontWeight: FontWeight.w600,
+                        ),
                       ),
-                    ),
+                    ],
                   ),
                 ),
               ),

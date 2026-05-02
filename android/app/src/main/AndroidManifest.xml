@@ -1,6 +1,7 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">`n    <uses-permission android:name="android.permission.INTERNET" />
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
     <application
-        android:label="nasa_apod_app"
+        android:label="Stellar Lens"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity

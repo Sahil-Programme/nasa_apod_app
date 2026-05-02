@@ -23,6 +23,7 @@ dependencies:
   wallpaper_manager_flutter: ^1.0.1
   gal: ^2.3.2
   google_fonts: ^8.1.0
+  wakelock_plus: ^1.4.0
 
 dev_dependencies:
   flutter_test:
@@ -30,6 +31,19 @@ dev_dependencies:
   flutter_driver:
     sdk: flutter
   flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.14.4
 
 flutter:
   uses-material-design: true
+
+flutter_launcher_icons:
+  android: true
+  ios: false
+  image_path: assets/branding/app_icon.png
+  min_sdk_android: 21
+  adaptive_icon_background: "#050A23"
+  adaptive_icon_foreground: assets/branding/app_icon_foreground.png
+  windows:
+    generate: true
+    image_path: assets/branding/app_icon.png
+    icon_size: 256

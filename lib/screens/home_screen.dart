@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math';
+import 'dart:ui';
 
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -10,6 +12,7 @@ import 'package:url_launcher/url_launcher.dart';
 import '../models/apod_entry.dart';
 import '../models/slideshow_config.dart';
 import '../providers/app_providers.dart';
+import '../services/nasa_api_service.dart';
 import '../services/wallpaper_service.dart';
 import '../ui/app_theme.dart';
 import '../ui/cosmic_scaffold.dart';
@@ -38,6 +41,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   bool _startupGateComplete = false;
   bool _startupGateFinalizing = false;
   bool _railExpanded = false;
+  bool _portraitActionsOpen = false;
   int _homeLoadToken = 0;
   DateTime? _progressiveImageDate;
   String? _progressiveImageUrl;
@@ -51,6 +55,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   Widget build(BuildContext context) {
     final key = ref.watch(apiKeyProvider);
     final current = ref.watch(currentEntryProvider);
+    final usePhonePortraitLayout = _shouldUsePhonePortraitLayout(context);
 
     if (key == null) {
       return const CosmicScaffold(
@@ -68,6 +73,43 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       return CosmicScaffold(child: _buildStartupSplash(current));
     }
 
+    if (usePhonePortraitLayout) {
+      return CosmicScaffold(
+        padding: const EdgeInsets.fromLTRB(10, 10, 10, 12),
+        child: Stack(
+          clipBehavior: Clip.none,
+          children: [
+            Positioned.fill(
+              child: _buildHomeWorkspace(
+                context,
+                current,
+                keyId: const ValueKey('home_workspace_phone_portrait'),
+              ),
+            ),
+            if (_portraitActionsOpen)
+              Positioned.fill(
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () => setState(() => _portraitActionsOpen = false),
+                  child: BackdropFilter(
+                    filter: ImageFilter.blur(sigmaX: 4, sigmaY: 4),
+                    child: Container(
+                      color: Colors.black.withValues(alpha: 0.16),
+                    ),
+                  ),
+                ),
+              ),
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: -22,
+              child: _buildPortraitActionBar(context, key, current.valueOrNull),
+            ),
+          ],
+        ),
+      );
+    }
+
     return CosmicScaffold(
       padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
       child: Row(
@@ -81,6 +123,311 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               current,
               keyId: const ValueKey('home_workspace'),
             ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  bool _shouldUsePhonePortraitLayout(BuildContext context) {
+    if (kIsWeb || (!Platform.isAndroid && !Platform.isIOS)) return false;
+    final media = MediaQuery.of(context);
+    return media.orientation == Orientation.portrait &&
+        media.size.shortestSide < 600;
+  }
+
+  Widget _buildPortraitActionBar(
+    BuildContext context,
+    String apiKey,
+    ApodEntry? currentEntry,
+  ) {
+    final actions =
+        <({IconData icon, String label, FutureOr<void> Function() onTap})>[
+          (
+            icon: Icons.today_outlined,
+            label: 'Today',
+            onTap: () => _load(
+              () => ref.read(nasaApiServiceProvider).fetchToday(apiKey),
+            ),
+          ),
+          (
+            icon: Icons.calendar_month_outlined,
+            label: 'Date',
+            onTap: () => _pickAndLoadDate(context, apiKey),
+          ),
+          (
+            icon: Icons.shuffle,
+            label: 'Random',
+            onTap: () => _load(
+              () => ref.read(nasaApiServiceProvider).fetchRandom(apiKey),
+              progressiveImageUpgrade: true,
+            ),
+          ),
+          (
+            icon: Icons.slideshow_outlined,
+            label: 'Slideshow',
+            onTap: () => _launchDirectionalSlideshow(context, apiKey),
+          ),
+          if (currentEntry?.shouldRenderAsImage == true &&
+              currentEntry?.bestImageUrl != null)
+            (
+              icon: Icons.wallpaper_outlined,
+              label: 'Wallpaper',
+              onTap: () => _setCurrentAsWallpaper(context, currentEntry!),
+            ),
+          (
+            icon: _infoPanelVisible
+                ? Icons.visibility_off_outlined
+                : Icons.visibility_outlined,
+            label: _infoPanelVisible ? 'Hide Info' : 'Show Info',
+            onTap: () {
+              setState(() => _infoPanelVisible = !_infoPanelVisible);
+            },
+          ),
+          (
+            icon: Icons.tune,
+            label: 'Settings',
+            onTap: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const SettingsScreen()),
+              );
+            },
+          ),
+        ];
+
+    final gridRows = actions.length <= 3 ? 1 : (actions.length <= 6 ? 2 : 3);
+    final panelHeight = 40.0 + (gridRows * 74.0);
+    final bottomInset = max(8.0, MediaQuery.of(context).padding.bottom);
+
+    return SizedBox(
+      height: panelHeight + 58 + bottomInset,
+      child: Padding(
+        padding: EdgeInsets.only(bottom: bottomInset),
+        child: Stack(
+          alignment: Alignment.bottomCenter,
+          children: [
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 0,
+              height: panelHeight,
+              child: IgnorePointer(
+                ignoring: !_portraitActionsOpen,
+                child: AnimatedOpacity(
+                  duration: const Duration(milliseconds: 1000),
+                  curve: Curves.easeInOutCubic,
+                  opacity: _portraitActionsOpen ? 1 : 0,
+                  child: AnimatedSlide(
+                    duration: const Duration(milliseconds: 1000),
+                    curve: Curves.easeInOutCubic,
+                    offset: _portraitActionsOpen
+                        ? Offset.zero
+                        : const Offset(0, 0.16),
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: AppTheme.card.withValues(alpha: 0.94),
+                        borderRadius: BorderRadius.circular(22),
+                        border: Border.all(
+                          color: AppTheme.accent.withValues(alpha: 0.2),
+                        ),
+                        boxShadow: const [
+                          BoxShadow(
+                            color: Color(0x42000000),
+                            blurRadius: 18,
+                            offset: Offset(0, 10),
+                          ),
+                        ],
+                      ),
+                      padding: const EdgeInsets.fromLTRB(10, 26, 10, 10),
+                      child: LayoutBuilder(
+                        builder: (context, constraints) {
+                          return _buildPortraitDockGrid(
+                            actions: actions,
+                            maxWidth: constraints.maxWidth,
+                          );
+                        },
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            AnimatedAlign(
+              duration: const Duration(milliseconds: 500),
+              curve: Curves.easeInOutCubic,
+              alignment: _portraitActionsOpen
+                  ? Alignment.topCenter
+                  : Alignment.bottomCenter,
+              child: Material(
+                color: Colors.transparent,
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(26),
+                  onTap: () {
+                    setState(
+                      () => _portraitActionsOpen = !_portraitActionsOpen,
+                    );
+                  },
+                  child: Ink(
+                    width: 52,
+                    height: 52,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: AppTheme.accent,
+                      boxShadow: [
+                        BoxShadow(
+                          color: AppTheme.accent.withValues(alpha: 0.35),
+                          blurRadius: 14,
+                          offset: const Offset(0, 6),
+                        ),
+                      ],
+                    ),
+                    child: AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 300),
+                      switchInCurve: Curves.easeOutCubic,
+                      switchOutCurve: Curves.easeInCubic,
+                      child: Icon(
+                        _portraitActionsOpen ? Icons.close : Icons.add,
+                        key: ValueKey(_portraitActionsOpen),
+                        color: AppTheme.bg,
+                        size: 24,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPortraitDockGrid({
+    required List<
+      ({IconData icon, String label, FutureOr<void> Function() onTap})
+    >
+    actions,
+    required double maxWidth,
+  }) {
+    const spacing = 8.0;
+    final tileWidth = (maxWidth - spacing * 2) / 3;
+
+    if (actions.length == 7) {
+      final firstRow = actions.sublist(0, 3);
+      final secondRow = actions.sublist(3, 6);
+      final last = actions[6];
+      return Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              for (var i = 0; i < firstRow.length; i++) ...[
+                if (i > 0) const SizedBox(width: spacing),
+                SizedBox(
+                  width: tileWidth,
+                  child: _portraitDockActionTile(
+                    icon: firstRow[i].icon,
+                    label: firstRow[i].label,
+                    onTap: () async {
+                      setState(() => _portraitActionsOpen = false);
+                      await firstRow[i].onTap();
+                    },
+                  ),
+                ),
+              ],
+            ],
+          ),
+          const SizedBox(height: spacing),
+          Row(
+            children: [
+              for (var i = 0; i < secondRow.length; i++) ...[
+                if (i > 0) const SizedBox(width: spacing),
+                SizedBox(
+                  width: tileWidth,
+                  child: _portraitDockActionTile(
+                    icon: secondRow[i].icon,
+                    label: secondRow[i].label,
+                    onTap: () async {
+                      setState(() => _portraitActionsOpen = false);
+                      await secondRow[i].onTap();
+                    },
+                  ),
+                ),
+              ],
+            ],
+          ),
+          const SizedBox(height: spacing),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              SizedBox(
+                width: tileWidth,
+                child: _portraitDockActionTile(
+                  icon: last.icon,
+                  label: last.label,
+                  onTap: () async {
+                    setState(() => _portraitActionsOpen = false);
+                    await last.onTap();
+                  },
+                ),
+              ),
+            ],
+          ),
+        ],
+      );
+    }
+
+    return SingleChildScrollView(
+      child: Wrap(
+        spacing: spacing,
+        runSpacing: spacing,
+        children: [
+          for (final action in actions)
+            SizedBox(
+              width: tileWidth,
+              child: _portraitDockActionTile(
+                icon: action.icon,
+                label: action.label,
+                onTap: () async {
+                  setState(() => _portraitActionsOpen = false);
+                  await action.onTap();
+                },
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _portraitDockActionTile({
+    required IconData icon,
+    required String label,
+    required Future<void> Function() onTap,
+  }) {
+    return FilledButton(
+      onPressed: () {
+        unawaited(onTap());
+      },
+      style: FilledButton.styleFrom(
+        minimumSize: const Size.fromHeight(66),
+        backgroundColor: AppTheme.panel.withValues(alpha: 0.5),
+        foregroundColor: Colors.white,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: BorderSide(color: AppTheme.accent.withValues(alpha: 0.16)),
+        ),
+      ),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(icon, size: 18, color: AppTheme.accentSoft),
+          const SizedBox(height: 6),
+          Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 11.5, fontWeight: FontWeight.w600),
           ),
         ],
       ),
@@ -135,21 +482,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             _railItem(
               icon: Icons.calendar_month_outlined,
               label: 'Date',
-              onTap: () async {
-                final date = await showDatePicker(
-                  context: context,
-                  firstDate: _firstApodDate,
-                  lastDate: _maxApodDate,
-                  initialDate: _maxApodDate,
-                );
-                if (date == null) return;
-                await _load(
-                  () => ref
-                      .read(nasaApiServiceProvider)
-                      .fetchByDate(apiKey, date),
-                  progressiveImageUpgrade: true,
-                );
-              },
+              onTap: () => _pickAndLoadDate(context, apiKey),
             ),
             const SizedBox(height: 8),
             _railItem(
@@ -275,7 +608,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            _buildHomeTopRow(context),
             const SizedBox(height: 12),
             Expanded(
               child: current.when(
@@ -296,33 +628,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     );
   }
 
-  Widget _buildHomeTopRow(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(
-          'HOME',
-          style: Theme.of(context).textTheme.titleMedium?.copyWith(
-            color: AppTheme.accentSoft,
-            fontWeight: FontWeight.w700,
-            letterSpacing: 0.4,
-          ),
-        ),
-        const SizedBox(height: 3),
-        Text(
-          'APOD of the day with details',
-          style: Theme.of(
-            context,
-          ).textTheme.bodySmall?.copyWith(color: AppTheme.textMuted),
-        ),
-      ],
-    );
-  }
-
   Widget _buildHomeEntryPanel(BuildContext context, ApodEntry entry) {
     return LayoutBuilder(
       builder: (context, constraints) {
         final isWide = constraints.maxWidth >= 1080;
+        final isPortrait = constraints.maxHeight > constraints.maxWidth;
         final mediaCard = _buildHomeMediaPanel(context, entry);
 
         if (!_infoPanelVisible) {
@@ -344,9 +654,9 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         return Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Expanded(flex: 6, child: mediaCard),
+            Expanded(flex: isPortrait ? 5 : 6, child: mediaCard),
             const SizedBox(height: 12),
-            Expanded(flex: 5, child: infoCard),
+            Expanded(flex: isPortrait ? 6 : 5, child: infoCard),
           ],
         );
       },
@@ -479,14 +789,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               style: Theme.of(
                 context,
               ).textTheme.bodyMedium?.copyWith(color: AppTheme.accentSoft),
-            ),
-            const SizedBox(height: 6),
-            Text(
-              'Media: ${entry.mediaType.toUpperCase()}',
-              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                color: AppTheme.accentSoft,
-                fontWeight: FontWeight.w600,
-              ),
             ),
             const SizedBox(height: 10),
             Expanded(
@@ -705,6 +1007,69 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     );
   }
 
+  Future<void> _pickAndLoadDate(BuildContext context, String apiKey) async {
+    final date = await showDatePicker(
+      context: context,
+      firstDate: _firstApodDate,
+      lastDate: _maxApodDate,
+      initialDate: _maxApodDate,
+    );
+    if (date == null) return;
+
+    await _load(
+      () => ref
+          .read(nasaApiServiceProvider)
+          .fetchNearestAvailableByDate(
+            apiKey,
+            date,
+            direction: ApodDateSearchDirection.backward,
+            maxSearchDays: 60,
+            minDate: _firstApodDate,
+            maxDate: _maxApodDate,
+          ),
+      progressiveImageUpgrade: true,
+    );
+
+    if (!context.mounted) return;
+    final loaded = ref.read(currentEntryProvider).valueOrNull;
+    if (loaded != null && !_isSameDay(loaded.date, date)) {
+      final requested = date.toIso8601String().split('T').first;
+      final resolved = loaded.date.toIso8601String().split('T').first;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'No APOD found on $requested. Loaded nearest available date: $resolved.',
+          ),
+        ),
+      );
+    }
+  }
+
+  Future<DateTime?> _resolveSlideshowAnchorDate(
+    String apiKey,
+    DateTime target,
+    SlideshowDirection direction,
+    DateTime latestAvailableDate,
+  ) async {
+    try {
+      final entry = await ref
+          .read(nasaApiServiceProvider)
+          .fetchNearestAvailableByDate(
+            apiKey,
+            target,
+            direction: direction == SlideshowDirection.forward
+                ? ApodDateSearchDirection.forward
+                : ApodDateSearchDirection.backward,
+            maxSearchDays: 120,
+            minDate: _firstApodDate,
+            maxDate: latestAvailableDate,
+          );
+      return DateTime(entry.date.year, entry.date.month, entry.date.day);
+    } catch (_) {
+      return null;
+    }
+  }
+
   Future<void> _launchDirectionalSlideshow(
     BuildContext context,
     String apiKey,
@@ -725,9 +1090,36 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       config.runDuration.inSeconds ~/ intervalSeconds,
     );
     final slideCount = min(requestedSlides, _maxSlideshowItems);
-    final safeSelectedDate = config.startDate.isAfter(latestAvailableDate)
+    final requestedDate = config.startDate.isAfter(latestAvailableDate)
         ? latestAvailableDate
         : config.startDate;
+    final safeSelectedDate = await _resolveSlideshowAnchorDate(
+      apiKey,
+      requestedDate,
+      config.direction,
+      latestAvailableDate,
+    );
+    if (safeSelectedDate == null) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'No APOD entry found near that start date in the chosen direction.',
+          ),
+        ),
+      );
+      return;
+    }
+
+    if (!_isSameDay(safeSelectedDate, requestedDate) && context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Adjusted slideshow start date to ${safeSelectedDate.toIso8601String().split('T').first} (nearest available APOD).',
+          ),
+        ),
+      );
+    }
 
     if (config.direction == SlideshowDirection.forward &&
         _isSameDay(safeSelectedDate, latestAvailableDate)) {
@@ -858,7 +1250,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           builder: (_) => SlideshowScreen(
             runDuration: config.runDuration,
             direction: config.direction,
-            startDate: config.startDate,
+            startDate: safeSelectedDate,
           ),
         ),
       );

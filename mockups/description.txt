@@ -1,0 +1,17 @@
+NASA APOD Explorer brings the universe's daily story to your phone with a clean, immersive viewer for NASA's Astronomy Picture of the Day.
+
+Explore today’s APOD, jump to any date, discover random space images, and enjoy distraction-free viewing for photos, videos, explanations, and wallpapers.
+
+Key features:
+- Browse NASA's Astronomy Picture of the Day with rich image and video support
+- View today, a selected date, or a random APOD for fast discovery
+- Read clear titles, dates, copyright details, and NASA explanations
+- Use immersive media viewing with optional hidden info controls
+- Run directional slideshows across date ranges with adjustable playback
+- Cache images for smoother browsing and manage stored data when needed
+- Set APOD images as wallpapers on supported platforms
+- Securely save your NASA API key on-device
+
+Built for space enthusiasts, astronomy learners, educators, photographers, and anyone who wants a focused daily window into the cosmos.
+
+NASA APOD Explorer is a concise, polished way to discover space imagery, learn the science behind each image, and turn remarkable astronomy moments into your everyday wallpaper.
