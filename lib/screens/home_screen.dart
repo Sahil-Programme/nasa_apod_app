@@ -2,8 +2,10 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../models/apod_entry.dart';
 import '../models/slideshow_config.dart';
@@ -11,7 +13,7 @@ import '../providers/app_providers.dart';
 import '../services/wallpaper_service.dart';
 import '../ui/app_theme.dart';
 import '../ui/cosmic_scaffold.dart';
-import '../widgets/apod_card.dart';
+import '../widgets/space_loading.dart';
 import 'detail_screen.dart';
 import 'settings_screen.dart';
 import 'slideshow_screen.dart';
@@ -26,34 +28,23 @@ class HomeScreen extends ConsumerStatefulWidget {
 
 class _HomeScreenState extends ConsumerState<HomeScreen> {
   static final DateTime _firstApodDate = DateTime(1995, 6, 16);
-  // Keep controls visible initially, then tuck them away for immersive viewing.
-  static const _controlAutoHideDelay = Duration(seconds: 5);
-  static const _pointerWakeDebounce = Duration(milliseconds: 250);
   // APOD allows 1000 requests/hour, but slideshow playback uses range fetches.
   // This cap prevents oversized range payloads and keeps startup responsive.
   static const _maxSlideshowItems = 1000; // APOD API limit
   static const _startupImageRollbackDays = 7;
 
-  Timer? _hideTimer;
-  bool _controlsVisible = true;
   bool _infoPanelVisible = true;
   bool _startupLoadScheduled = false;
-  DateTime _lastPointerWake = DateTime.fromMillisecondsSinceEpoch(0);
+  bool _startupGateComplete = false;
+  bool _startupGateFinalizing = false;
+  bool _railExpanded = false;
+  int _homeLoadToken = 0;
+  DateTime? _progressiveImageDate;
+  String? _progressiveImageUrl;
+
   DateTime get _maxApodDate {
     final nowUtc = DateTime.now().toUtc();
     return DateTime(nowUtc.year, nowUtc.month, nowUtc.day);
-  }
-
-  @override
-  void initState() {
-    super.initState();
-    _armAutoHideTimer();
-  }
-
-  @override
-  void dispose() {
-    _hideTimer?.cancel();
-    super.dispose();
   }
 
   @override
@@ -63,86 +54,453 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
     if (key == null) {
       return const CosmicScaffold(
-        child: Center(child: CircularProgressIndicator()),
+        child: Center(
+          child: SpaceLoadingIndicator(
+            size: SpaceIndicatorSize.small,
+            semanticLabel: 'Loading home screen',
+          ),
+        ),
       );
     }
+
     _ensureStartupEntryLoaded(key, current);
+    if (!_startupGateComplete) {
+      return CosmicScaffold(child: _buildStartupSplash(current));
+    }
 
     return CosmicScaffold(
-      child: Listener(
-        onPointerHover: (_) => _onPointerActivity(),
-        onPointerMove: (_) => _onPointerActivity(),
-        onPointerDown: (_) => _showControlsTemporarily(),
-        child: GestureDetector(
-          behavior: HitTestBehavior.translucent,
-          onTap: _showControlsTemporarily,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              AnimatedSize(
-                duration: const Duration(milliseconds: 240),
-                curve: Curves.easeOutCubic,
-                child: _controlsVisible
-                    ? Padding(
-                        padding: const EdgeInsets.only(bottom: 12),
-                        child: _buildTopControlPanel(
-                          context,
-                          key,
-                          current.valueOrNull,
-                        ),
-                      )
-                    : Align(
-                        alignment: Alignment.centerRight,
-                        child: _roundOverlayButton(
-                          context: context,
-                          icon: Icons.keyboard_arrow_down,
-                          tooltip: 'Show controls',
-                          onPressed: _showControlsTemporarily,
-                        ),
-                      ),
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _buildLeftRail(context, key, current.valueOrNull),
+          const SizedBox(width: 12),
+          Expanded(
+            child: _buildHomeWorkspace(
+              context,
+              current,
+              keyId: const ValueKey('home_workspace'),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildLeftRail(
+    BuildContext context,
+    String apiKey,
+    ApodEntry? currentEntry,
+  ) {
+    final width = _railExpanded ? 178.0 : 76.0;
+
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 180),
+      width: width,
+      decoration: BoxDecoration(
+        color: AppTheme.card.withValues(alpha: 0.78),
+        borderRadius: BorderRadius.circular(22),
+        border: Border.all(color: AppTheme.accent.withValues(alpha: 0.14)),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x33000000),
+            blurRadius: 20,
+            offset: Offset(0, 10),
+          ),
+        ],
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+        child: Column(
+          children: [
+            IconButton(
+              tooltip: _railExpanded ? 'Collapse rail' : 'Expand rail',
+              onPressed: () => setState(() => _railExpanded = !_railExpanded),
+              icon: Icon(
+                _railExpanded ? Icons.menu_open : Icons.menu,
+                color: AppTheme.accentSoft,
               ),
-              Expanded(
-                child: current.when(
-                  data: (entry) => entry == null
-                      ? _emptyPanel(context)
-                      : LayoutBuilder(
-                          builder: (context, constraints) {
-                            final isWide = constraints.maxWidth >= 900;
-                            final targetAspectRatio = isWide
-                                ? (16 / 10)
-                                : (4 / 5);
-                            return Center(
-                              child: ConstrainedBox(
-                                constraints: const BoxConstraints(
-                                  maxWidth: 1500,
-                                ),
-                                child: AspectRatio(
-                                  aspectRatio: targetAspectRatio,
-                                  child: ApodCard(
-                                    entry: entry,
-                                    showInfoPanel: _infoPanelVisible,
-                                    onTap: () {
-                                      Navigator.push(
-                                        context,
-                                        MaterialPageRoute(
-                                          builder: (_) =>
-                                              DetailScreen(entry: entry),
-                                        ),
-                                      );
-                                    },
-                                  ),
-                                ),
-                              ),
-                            );
-                          },
-                        ),
-                  loading: () =>
-                      const Center(child: CircularProgressIndicator()),
-                  error: (e, _) => _errorPanel(context, e.toString()),
-                ),
+            ),
+            const SizedBox(height: 8),
+
+            const SizedBox(height: 8),
+            _railItem(
+              icon: Icons.today_outlined,
+              label: 'Today',
+              onTap: () => _load(
+                () => ref.read(nasaApiServiceProvider).fetchToday(apiKey),
+              ),
+            ),
+            const SizedBox(height: 8),
+            _railItem(
+              icon: Icons.calendar_month_outlined,
+              label: 'Date',
+              onTap: () async {
+                final date = await showDatePicker(
+                  context: context,
+                  firstDate: _firstApodDate,
+                  lastDate: _maxApodDate,
+                  initialDate: _maxApodDate,
+                );
+                if (date == null) return;
+                await _load(
+                  () => ref
+                      .read(nasaApiServiceProvider)
+                      .fetchByDate(apiKey, date),
+                  progressiveImageUpgrade: true,
+                );
+              },
+            ),
+            const SizedBox(height: 8),
+            _railItem(
+              icon: Icons.shuffle,
+              label: 'Random',
+              onTap: () => _load(
+                () => ref.read(nasaApiServiceProvider).fetchRandom(apiKey),
+                progressiveImageUpgrade: true,
+              ),
+            ),
+            const SizedBox(height: 8),
+            _railItem(
+              icon: Icons.slideshow_outlined,
+              label: 'Slideshow',
+              onTap: () => _launchDirectionalSlideshow(context, apiKey),
+            ),
+            if (currentEntry?.shouldRenderAsImage == true &&
+                currentEntry?.bestImageUrl != null) ...[
+              const SizedBox(height: 8),
+              _railItem(
+                icon: Icons.wallpaper_outlined,
+                label: 'Wallpaper',
+                onTap: () => _setCurrentAsWallpaper(context, currentEntry!),
               ),
             ],
+            const Spacer(),
+            _railItem(
+              icon: _infoPanelVisible
+                  ? Icons.visibility_off_outlined
+                  : Icons.visibility_outlined,
+              label: _infoPanelVisible ? 'Hide Info' : 'Show Info',
+              onTap: () =>
+                  setState(() => _infoPanelVisible = !_infoPanelVisible),
+            ),
+            const SizedBox(height: 8),
+            _railItem(
+              icon: Icons.tune,
+              label: 'Settings',
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const SettingsScreen()),
+                );
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _railItem({
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+    bool selected = false,
+  }) {
+    final iconWidget = Icon(
+      icon,
+      size: 21,
+      color: selected ? AppTheme.bg : AppTheme.accentSoft,
+    );
+    final textWidget = Text(
+      label,
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: TextStyle(
+        color: selected ? AppTheme.bg : Colors.white,
+        fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+      ),
+    );
+
+    return Tooltip(
+      message: label,
+      waitDuration: const Duration(milliseconds: 320),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(14),
+        onTap: onTap,
+        child: Ink(
+          height: 46,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(14),
+            color: selected
+                ? AppTheme.accent.withValues(alpha: 0.95)
+                : AppTheme.panel.withValues(alpha: 0.46),
+            border: Border.all(
+              color: selected
+                  ? Colors.transparent
+                  : AppTheme.accent.withValues(alpha: 0.16),
+            ),
           ),
+          child: Padding(
+            padding: EdgeInsets.symmetric(horizontal: _railExpanded ? 12 : 0),
+            child: _railExpanded
+                ? Row(
+                    children: [
+                      iconWidget,
+                      const SizedBox(width: 10),
+                      Expanded(child: textWidget),
+                    ],
+                  )
+                : Center(child: iconWidget),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildHomeWorkspace(
+    BuildContext context,
+    AsyncValue<ApodEntry?> current, {
+    required Key keyId,
+  }) {
+    return Container(
+      key: keyId,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(24),
+        color: AppTheme.card.withValues(alpha: 0.55),
+        border: Border.all(color: AppTheme.accent.withValues(alpha: 0.12)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            _buildHomeTopRow(context),
+            const SizedBox(height: 12),
+            Expanded(
+              child: current.when(
+                data: (entry) => entry == null
+                    ? _emptyPanel(context)
+                    : _buildHomeEntryPanel(context, entry),
+                loading: () => const Center(
+                  child: SpaceLoadingIndicator(
+                    semanticLabel: 'Loading APOD entry',
+                  ),
+                ),
+                error: (e, _) => _errorPanel(context, e.toString()),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildHomeTopRow(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'HOME',
+          style: Theme.of(context).textTheme.titleMedium?.copyWith(
+            color: AppTheme.accentSoft,
+            fontWeight: FontWeight.w700,
+            letterSpacing: 0.4,
+          ),
+        ),
+        const SizedBox(height: 3),
+        Text(
+          'APOD of the day with details',
+          style: Theme.of(
+            context,
+          ).textTheme.bodySmall?.copyWith(color: AppTheme.textMuted),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildHomeEntryPanel(BuildContext context, ApodEntry entry) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final isWide = constraints.maxWidth >= 1080;
+        final mediaCard = _buildHomeMediaPanel(context, entry);
+
+        if (!_infoPanelVisible) {
+          return mediaCard;
+        }
+
+        final infoCard = _buildHomeInfoPanel(context, entry);
+        if (isWide) {
+          return Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Expanded(flex: 7, child: mediaCard),
+              const SizedBox(width: 12),
+              Expanded(flex: 4, child: infoCard),
+            ],
+          );
+        }
+
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Expanded(flex: 6, child: mediaCard),
+            const SizedBox(height: 12),
+            Expanded(flex: 5, child: infoCard),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildHomeMediaPanel(BuildContext context, ApodEntry entry) {
+    return Container(
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(20),
+        color: const Color(0xC40A1121),
+        border: Border.all(color: AppTheme.accent.withValues(alpha: 0.16)),
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(20),
+        child: Material(
+          color: Colors.transparent,
+          child: InkWell(
+            onTap: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => DetailScreen(entry: entry)),
+              );
+            },
+            child: _buildEntryMediaSurface(entry),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildEntryMediaSurface(ApodEntry entry) {
+    final imageUrl = _effectiveHomeImageUrl(entry);
+    if (entry.shouldRenderAsImage && imageUrl != null && imageUrl.isNotEmpty) {
+      return LayoutBuilder(
+        builder: (context, constraints) {
+          return SizedBox(
+            width: constraints.maxWidth,
+            height: constraints.maxHeight,
+            child: Center(
+              child: AnimatedSwitcher(
+                duration: const Duration(milliseconds: 420),
+                switchInCurve: Curves.easeOutCubic,
+                switchOutCurve: Curves.easeInCubic,
+                child: CachedNetworkImage(
+                  key: ValueKey(
+                    'home_img_${entry.date.toIso8601String()}_$imageUrl',
+                  ),
+                  imageUrl: imageUrl,
+                  fit: BoxFit.contain,
+                  width: constraints.maxWidth,
+                  height: constraints.maxHeight,
+                  placeholder: (_, _) => const Center(
+                    child: SpaceLoadingIndicator(
+                      size: SpaceIndicatorSize.small,
+                      semanticLabel: 'Loading image',
+                    ),
+                  ),
+                  errorWidget: (_, _, _) => const Icon(
+                    Icons.broken_image_outlined,
+                    color: Colors.white70,
+                    size: 38,
+                  ),
+                ),
+              ),
+            ),
+          );
+        },
+      );
+    }
+
+    final thumbnail = entry.thumbnailUrl;
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        if (thumbnail != null)
+          CachedNetworkImage(
+            imageUrl: thumbnail,
+            fit: BoxFit.cover,
+            placeholder: (_, _) =>
+                const SpaceImagePlaceholder(showIndicator: false),
+            errorWidget: (_, _, _) =>
+                const SpaceImagePlaceholder(showIndicator: false),
+          )
+        else
+          const SpaceImagePlaceholder(showIndicator: false),
+        Container(color: Colors.black.withValues(alpha: 0.38)),
+        Center(
+          child: ElevatedButton.icon(
+            onPressed: entry.launchUrl == null
+                ? null
+                : () => launchUrl(Uri.parse(entry.launchUrl!)),
+            icon: Icon(
+              entry.shouldRenderAsAudio ? Icons.graphic_eq : Icons.open_in_new,
+            ),
+            label: Text(
+              entry.shouldRenderAsAudio ? 'Open Audio' : 'Open Media',
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildHomeInfoPanel(BuildContext context, ApodEntry entry) {
+    final dateText = _formatDate(entry.date);
+    return Container(
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(20),
+        color: const Color(0xAA11213E),
+        border: Border.all(color: AppTheme.accent.withValues(alpha: 0.14)),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              entry.title,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                color: Colors.white,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              dateText,
+              style: Theme.of(
+                context,
+              ).textTheme.bodyMedium?.copyWith(color: AppTheme.accentSoft),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              'Media: ${entry.mediaType.toUpperCase()}',
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                color: AppTheme.accentSoft,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 10),
+            Expanded(
+              child: SingleChildScrollView(
+                child: Text(
+                  entry.explanation,
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: Colors.white70,
+                    height: 1.4,
+                  ),
+                ),
+              ),
+            ),
+          ],
         ),
       ),
     );
@@ -156,6 +514,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     if (current.isLoading) return;
     if (current.valueOrNull != null) {
       _startupLoadScheduled = true;
+      Future.microtask(() => _finalizeStartupGate(entry: current.valueOrNull));
       return;
     }
     _startupLoadScheduled = true;
@@ -164,32 +523,61 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
   Future<void> _loadLatestDisplayableImage(String apiKey) async {
     ref.read(currentEntryProvider.notifier).state = const AsyncLoading();
-    final latestAvailableDate = await _resolveLatestAvailableDate(apiKey);
-    for (var offset = 0; offset < _startupImageRollbackDays; offset++) {
-      final date = latestAvailableDate.subtract(Duration(days: offset));
-      try {
-        final entry = offset == 0
-            ? await ref.read(nasaApiServiceProvider).fetchToday(apiKey)
-            : await ref.read(nasaApiServiceProvider).fetchByDate(apiKey, date);
-        if (_isDisplayableStartupImage(entry)) {
-          ref.read(currentEntryProvider.notifier).state = AsyncData(entry);
-          unawaited(
-            ref
-                .read(cacheServiceProvider)
-                .warmEntry(entry, reason: 'home_startup'),
-          );
-          return;
+    try {
+      final latestAvailableDate = await _resolveLatestAvailableDate(apiKey);
+      for (var offset = 0; offset < _startupImageRollbackDays; offset++) {
+        final date = latestAvailableDate.subtract(Duration(days: offset));
+        try {
+          final entry = offset == 0
+              ? await ref.read(nasaApiServiceProvider).fetchToday(apiKey)
+              : await ref
+                    .read(nasaApiServiceProvider)
+                    .fetchByDate(apiKey, date);
+          if (_isDisplayableStartupImage(entry)) {
+            ref.read(currentEntryProvider.notifier).state = AsyncData(entry);
+            unawaited(
+              ref
+                  .read(cacheServiceProvider)
+                  .warmEntry(entry, reason: 'home_startup'),
+            );
+            await _finalizeStartupGate(entry: entry);
+            return;
+          }
+        } catch (_) {
+          // Keep searching previous days for a displayable image.
         }
+      }
+      ref.read(currentEntryProvider.notifier).state = AsyncError(
+        StateError(
+          'No displayable APOD image found in the last $_startupImageRollbackDays day(s). Try Date or Random.',
+        ),
+        StackTrace.current,
+      );
+    } catch (e, st) {
+      ref.read(currentEntryProvider.notifier).state = AsyncError(e, st);
+    }
+    await _finalizeStartupGate();
+  }
+
+  Future<void> _finalizeStartupGate({ApodEntry? entry}) async {
+    if (_startupGateComplete || _startupGateFinalizing) return;
+    _startupGateFinalizing = true;
+    final imageUrl = entry?.bestImageUrl;
+    if (entry != null &&
+        entry.shouldRenderAsImage &&
+        imageUrl != null &&
+        imageUrl.trim().isNotEmpty) {
+      try {
+        await precacheImage(CachedNetworkImageProvider(imageUrl), context);
       } catch (_) {
-        // Keep searching previous days for a displayable image.
+        // Startup should proceed even if image decoding/network fails.
       }
     }
-    ref.read(currentEntryProvider.notifier).state = AsyncError(
-      StateError(
-        'No displayable APOD image found in the last $_startupImageRollbackDays day(s). Try Date or Random.',
-      ),
-      StackTrace.current,
-    );
+    if (!mounted) return;
+    setState(() {
+      _startupGateComplete = true;
+      _startupGateFinalizing = false;
+    });
   }
 
   bool _isDisplayableStartupImage(ApodEntry entry) {
@@ -218,106 +606,101 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     return !blocked.any(lower.endsWith);
   }
 
-  /// Tracks user activity and re-arms auto-hide for the top controls.
-  void _showControlsTemporarily() {
-    if (!_controlsVisible) {
-      setState(() => _controlsVisible = true);
-    }
-    _armAutoHideTimer();
+  Widget _buildStartupSplash(AsyncValue<ApodEntry?> current) {
+    final status = current.when(
+      data: (_) => 'Preparing your first APOD frame...',
+      loading: () => 'Loading today\'s space image...',
+      error: (_, _) => 'Could not preload image. Opening explorer...',
+    );
+
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        Container(
+          decoration: const BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [Color(0xFF040814), Color(0xFF0A1230), Color(0xFF130E2A)],
+            ),
+          ),
+        ),
+        Positioned(
+          top: -90,
+          left: -30,
+          child: _splashGlow(220, const Color(0x3348A8FF)),
+        ),
+        Positioned(
+          bottom: -120,
+          right: -60,
+          child: _splashGlow(260, const Color(0x446D3BFF)),
+        ),
+        Positioned.fill(child: CustomPaint(painter: _StarfieldPainter())),
+        Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 104,
+                height: 104,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  gradient: const RadialGradient(
+                    colors: [
+                      Color(0xFF7FCBFF),
+                      Color(0xFF1D4D9E),
+                      Color(0x00234C94),
+                    ],
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: const Color(0xFF5B8CFF).withValues(alpha: 0.32),
+                      blurRadius: 34,
+                      spreadRadius: 6,
+                    ),
+                  ],
+                ),
+                child: const Icon(Icons.public, size: 48, color: Colors.white),
+              ),
+              const SizedBox(height: 22),
+              Text(
+                'NASA APOD Explorer',
+                style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                  color: Colors.white,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                status,
+                textAlign: TextAlign.center,
+                style: Theme.of(
+                  context,
+                ).textTheme.bodyMedium?.copyWith(color: Colors.white70),
+              ),
+              const SizedBox(height: 18),
+              const SizedBox(
+                width: 26,
+                height: 26,
+                child: SpaceLoadingIndicator(
+                  size: SpaceIndicatorSize.small,
+                  semanticLabel: 'Loading startup data',
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
   }
 
-  void _armAutoHideTimer() {
-    _hideTimer?.cancel();
-    _hideTimer = Timer(_controlAutoHideDelay, () {
-      if (!mounted) return;
-      setState(() => _controlsVisible = false);
-    });
-  }
-
-  void _onPointerActivity() {
-    final now = DateTime.now();
-    if (now.difference(_lastPointerWake) < _pointerWakeDebounce) return;
-    _lastPointerWake = now;
-    _showControlsTemporarily();
-  }
-
-  /// Floating control strip containing fetch actions and navigation affordances.
-  Widget _buildTopControlPanel(
-    BuildContext context,
-    String apiKey,
-    ApodEntry? currentEntry,
-  ) {
+  Widget _splashGlow(double size, Color color) {
     return Container(
+      width: size,
+      height: size,
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(18),
-        color: AppTheme.card.withValues(alpha: 0.82),
-        border: Border.all(color: AppTheme.accent.withValues(alpha: 0.22)),
-        boxShadow: const [
-          BoxShadow(
-            color: Color(0x33000000),
-            blurRadius: 26,
-            offset: Offset(0, 10),
-          ),
-        ],
-      ),
-      padding: const EdgeInsets.all(10),
-      child: Wrap(
-        runSpacing: 8,
-        spacing: 8,
-        crossAxisAlignment: WrapCrossAlignment.center,
-        children: [
-          _actionChip(context, 'Today', Icons.today, () async {
-            _showControlsTemporarily();
-            await _load(
-              () => ref.read(nasaApiServiceProvider).fetchToday(apiKey),
-            );
-          }),
-          _actionChip(context, 'Date', Icons.calendar_month, () async {
-            _showControlsTemporarily();
-            final date = await showDatePicker(
-              context: context,
-              firstDate: _firstApodDate,
-              lastDate: _maxApodDate,
-              initialDate: _maxApodDate,
-            );
-            if (date == null) return;
-            await _load(
-              () => ref.read(nasaApiServiceProvider).fetchByDate(apiKey, date),
-            );
-          }),
-          _actionChip(context, 'Random', Icons.shuffle, () async {
-            _showControlsTemporarily();
-            await _load(
-              () => ref.read(nasaApiServiceProvider).fetchRandom(apiKey),
-            );
-          }),
-          _actionChip(context, 'Slideshow', Icons.slideshow, () async {
-            _showControlsTemporarily();
-            await _launchDirectionalSlideshow(context, apiKey);
-          }),
-          if (currentEntry?.shouldRenderAsImage == true &&
-              currentEntry?.bestImageUrl != null)
-            _actionChip(context, 'Wallpaper', Icons.wallpaper, () async {
-              _showControlsTemporarily();
-              await _setCurrentAsWallpaper(context, currentEntry!);
-            }),
-          _actionChip(
-            context,
-            _infoPanelVisible ? 'Hide Info' : 'Show Info',
-            _infoPanelVisible ? Icons.visibility_off : Icons.info_outline,
-            () {
-              setState(() => _infoPanelVisible = !_infoPanelVisible);
-              _showControlsTemporarily();
-            },
-          ),
-          _actionChip(context, 'Settings', Icons.tune, () {
-            _showControlsTemporarily();
-            Navigator.push(
-              context,
-              MaterialPageRoute(builder: (_) => const SettingsScreen()),
-            );
-          }),
-        ],
+        shape: BoxShape.circle,
+        boxShadow: [BoxShadow(color: color, blurRadius: 80, spreadRadius: 30)],
       ),
     );
   }
@@ -335,7 +718,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     );
     if (!context.mounted || config == null) return;
 
-    final intervalSeconds = ref.read(slideshowIntervalProvider);
+    final intervalSeconds = ref.read(slideshowIntervalProvider).clamp(8, 300);
     // Runtime is translated to an estimated number of APOD dates to request.
     final requestedSlides = max(
       1,
@@ -495,7 +878,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     BuildContext context, {
     required DateTime latestAvailableDate,
   }) async {
-    final intervalSeconds = ref.read(slideshowIntervalProvider);
+    final intervalSeconds = ref.read(slideshowIntervalProvider).clamp(8, 300);
     DateTime selectedDate = latestAvailableDate;
     SlideshowDirection direction = SlideshowDirection.forward;
     double durationMinutes = 10;
@@ -613,11 +996,35 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   bool _isSameDay(DateTime a, DateTime b) =>
       a.year == b.year && a.month == b.month && a.day == b.day;
 
-  Future<void> _load(Future<ApodEntry> Function() loader) async {
+  Future<void> _load(
+    Future<ApodEntry> Function() loader, {
+    bool progressiveImageUpgrade = false,
+  }) async {
+    _homeLoadToken++;
+    _clearProgressiveImageOverride();
     ref.read(currentEntryProvider.notifier).state = const AsyncLoading();
     try {
       final entry = await loader();
       ref.read(currentEntryProvider.notifier).state = AsyncData(entry);
+      if (progressiveImageUpgrade && entry.shouldRenderAsImage) {
+        final lowUrl = _lowestQualityImageUrl(entry);
+        if (lowUrl != null && lowUrl.trim().isNotEmpty) {
+          _setProgressiveImageOverride(entry.date, lowUrl);
+          final highUrl = entry.bestImageUrl;
+          final token = _homeLoadToken;
+          if (highUrl != null &&
+              highUrl.trim().isNotEmpty &&
+              highUrl != lowUrl) {
+            unawaited(
+              _upgradeProgressiveHomeImage(
+                entry: entry,
+                highUrl: highUrl,
+                token: token,
+              ),
+            );
+          }
+        }
+      }
       unawaited(
         ref.read(cacheServiceProvider).warmEntry(entry, reason: 'home'),
       );
@@ -627,6 +1034,64 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         StackTrace.current,
       );
     }
+  }
+
+  String? _effectiveHomeImageUrl(ApodEntry entry) {
+    final override = _progressiveImageUrl;
+    final date = _progressiveImageDate;
+    if (override != null &&
+        date != null &&
+        entry.shouldRenderAsImage &&
+        _isSameDay(entry.date, date)) {
+      return override;
+    }
+    return entry.bestImageUrl;
+  }
+
+  String? _lowestQualityImageUrl(ApodEntry entry) {
+    final candidate = entry.thumbnailUrl ?? entry.url ?? entry.hdurl;
+    if (candidate == null || candidate.trim().isEmpty) {
+      return entry.bestImageUrl;
+    }
+    return candidate;
+  }
+
+  void _setProgressiveImageOverride(DateTime date, String url) {
+    if (_progressiveImageUrl == url &&
+        _progressiveImageDate != null &&
+        _isSameDay(_progressiveImageDate!, date)) {
+      return;
+    }
+    if (!mounted) return;
+    setState(() {
+      _progressiveImageDate = date;
+      _progressiveImageUrl = url;
+    });
+  }
+
+  void _clearProgressiveImageOverride() {
+    if (_progressiveImageDate == null && _progressiveImageUrl == null) return;
+    if (!mounted) return;
+    setState(() {
+      _progressiveImageDate = null;
+      _progressiveImageUrl = null;
+    });
+  }
+
+  Future<void> _upgradeProgressiveHomeImage({
+    required ApodEntry entry,
+    required String highUrl,
+    required int token,
+  }) async {
+    try {
+      await precacheImage(CachedNetworkImageProvider(highUrl), context);
+    } catch (_) {
+      return;
+    }
+    if (!mounted || token != _homeLoadToken) return;
+    final current = ref.read(currentEntryProvider).valueOrNull;
+    if (current == null || !_isSameDay(current.date, entry.date)) return;
+    _setProgressiveImageOverride(entry.date, highUrl);
   }
 
   Future<void> _setCurrentAsWallpaper(
@@ -682,74 +1147,23 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     );
   }
 
-  Widget _actionChip(
-    BuildContext context,
-    String label,
-    IconData icon,
-    VoidCallback onTap,
-  ) {
-    return InkWell(
-      borderRadius: BorderRadius.circular(14),
-      onTap: onTap,
-      child: Ink(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(14),
-          color: AppTheme.panel.withValues(alpha: 0.66),
-          border: Border.all(color: AppTheme.accent.withValues(alpha: 0.2)),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, size: 18, color: AppTheme.accentSoft),
-            const SizedBox(width: 8),
-            Text(
-              label,
-              style: Theme.of(
-                context,
-              ).textTheme.bodyMedium?.copyWith(color: Colors.white),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _roundOverlayButton({
-    required BuildContext context,
-    required IconData icon,
-    required String tooltip,
-    required VoidCallback onPressed,
-  }) {
-    return Tooltip(
-      message: tooltip,
-      child: IconButton.filledTonal(
-        onPressed: onPressed,
-        style: IconButton.styleFrom(
-          backgroundColor: AppTheme.card.withValues(alpha: 0.78),
-          foregroundColor: AppTheme.accentSoft,
-          side: BorderSide(color: AppTheme.accent.withValues(alpha: 0.25)),
-        ),
-        icon: Icon(icon),
-      ),
-    );
-  }
+  String _formatDate(DateTime date) => date.toIso8601String().split('T').first;
 
   Widget _emptyPanel(BuildContext context) {
     return Container(
       width: double.infinity,
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(24),
-        border: Border.all(color: AppTheme.accent.withValues(alpha: 0.18)),
+        borderRadius: BorderRadius.circular(22),
+        border: Border.all(color: AppTheme.accent.withValues(alpha: 0.16)),
         gradient: const LinearGradient(
-          colors: [Color(0x88203457), Color(0x55131A2B)],
+          colors: [Color(0x66203A63), Color(0x33131A2B)],
         ),
       ),
       child: Center(
         child: Padding(
           padding: const EdgeInsets.all(20),
           child: Text(
-            'Load an APOD item from the top control panel. Controls auto-hide after a few seconds to keep viewing uninterrupted.',
+            'Load an APOD item using Today, Date, or Random.',
             textAlign: TextAlign.center,
             style: Theme.of(context).textTheme.bodyLarge,
           ),
@@ -774,4 +1188,26 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       ),
     );
   }
+}
+
+class _StarfieldPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()..color = Colors.white.withValues(alpha: 0.78);
+    final dimPaint = Paint()..color = Colors.white.withValues(alpha: 0.35);
+    final maxX = size.width;
+    final maxY = size.height;
+    if (maxX <= 0 || maxY <= 0) return;
+
+    for (var i = 0; i < 120; i++) {
+      final seed = i * 97;
+      final x = (seed * 73 % 1000) / 1000 * maxX;
+      final y = (seed * 37 % 1000) / 1000 * maxY;
+      final radius = i % 7 == 0 ? 1.7 : 1.0;
+      canvas.drawCircle(Offset(x, y), radius, i.isEven ? paint : dimPaint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }

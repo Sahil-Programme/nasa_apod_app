@@ -15,6 +15,7 @@ import '../providers/app_providers.dart';
 import '../services/wallpaper_service.dart';
 import '../ui/app_theme.dart';
 import '../ui/cosmic_scaffold.dart';
+import '../widgets/space_loading.dart';
 
 /// Fullscreen slideshow player for preloaded APOD entries.
 class SlideshowScreen extends ConsumerStatefulWidget {
@@ -54,9 +55,21 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   final Set<String> _failedImageSlides = <String>{};
   final Map<String, String?> _resolvedLaunchPreview = <String, String?>{};
   final Set<String> _previewResolveInFlight = <String>{};
+  final Set<String> _hdUpgradeReadyUrls = <String>{};
+  final Set<String> _hdUpgradeInFlightUrls = <String>{};
+  int _prefetchReadyCount = 0;
+  int _prefetchTargetCount = 0;
 
   static const _controlsHideDelay = Duration(seconds: 4);
   static const _pointerWakeDebounce = Duration(milliseconds: 250);
+
+  List<ApodEntry> _playableItems([List<ApodEntry>? source]) {
+    final items =
+        source ?? ref.read(slideshowEntriesProvider) ?? const <ApodEntry>[];
+    return items
+        .where((entry) => !entry.shouldRenderAsVideo)
+        .toList(growable: false);
+  }
 
   @override
   void initState() {
@@ -67,7 +80,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   }
 
   Future<void> _bootstrapSlideshow() async {
-    final items = ref.read(slideshowEntriesProvider);
+    final items = _playableItems();
     if (items.isEmpty) {
       if (mounted) {
         setState(() => _initialVisualReady = true);
@@ -78,16 +91,22 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     await _prepareInitialVisual(items.first);
     if (!mounted) return;
 
-    setState(() => _initialVisualReady = true);
+    setState(() {
+      _initialVisualReady = true;
+      _startupCacheReady = true;
+    });
     _activateSlideForIndex(0);
-    try {
-      await _syncSlidingCacheForIndex(0, reason: 'bootstrap');
-    } finally {
-      if (mounted) {
-        setState(() => _startupCacheReady = true);
-        _tick();
-      }
+    _tick();
+    final first = items.first;
+    final firstFast = first.slideshowImageUrl;
+    final firstHd = first.hdurl;
+    if (firstFast != null &&
+        firstHd != null &&
+        firstHd.trim().isNotEmpty &&
+        firstHd != firstFast) {
+      unawaited(_primeHdUpgrade(first));
     }
+    unawaited(_syncSlidingCacheForIndex(0, reason: 'bootstrap'));
   }
 
   Future<void> _prepareInitialVisual(ApodEntry entry) async {
@@ -104,21 +123,35 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     int index, {
     required String reason,
   }) async {
-    final items = ref.read(slideshowEntriesProvider);
+    final items = _playableItems();
     if (items.isEmpty) return;
     final window = ref.read(precacheWindowProvider).clamp(5, 15);
     final start = max(0, index - window);
     final end = min(items.length - 1, index + window);
     final urls = <String>{};
+    final hdCandidates = <ApodEntry>[];
     for (var idx = start; idx <= end; idx++) {
-      final preview = _previewUrlForCaching(items[idx]);
+      final entry = items[idx];
+      final preview = _previewUrlForCaching(entry);
       if (preview != null && preview.trim().isNotEmpty) {
         urls.add(preview);
       }
+      if (entry.shouldRenderAsImage) {
+        final fast = entry.slideshowImageUrl;
+        final hd = entry.hdurl;
+        if (fast != null && hd != null && hd.trim().isNotEmpty && hd != fast) {
+          hdCandidates.add(entry);
+        }
+      }
+    }
+    for (final entry in hdCandidates) {
+      unawaited(_primeHdUpgrade(entry));
     }
     await ref
         .read(cacheServiceProvider)
         .syncSlideshowWindowUrls(urls, reason: '$reason:idx=$index');
+    if (!mounted) return;
+    await _refreshPrefetchStatus(urls);
   }
 
   /// Starts or refreshes the periodic frame-advance loop.
@@ -126,9 +159,8 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     t?.cancel();
     if (!playing) return;
 
-    t = Timer.periodic(Duration(seconds: ref.read(slideshowIntervalProvider)), (
-      _,
-    ) {
+    final interval = ref.read(slideshowIntervalProvider).clamp(8, 300);
+    t = Timer.periodic(Duration(seconds: interval), (_) {
       if (!_startupCacheReady) return;
       if (DateTime.now().difference(_startedAt) >= widget.runDuration) {
         setState(() => playing = false);
@@ -162,23 +194,33 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   }
 
   void _advanceToNext() {
-    final items = ref.read(slideshowEntriesProvider);
+    final items = _playableItems();
     if (items.isEmpty) return;
     final next = ((i + 1) % items.length).toInt();
     _goToIndex(next);
   }
 
   void _goToIndex(int index) {
-    final items = ref.read(slideshowEntriesProvider);
+    final items = _playableItems();
     if (items.isEmpty) return;
     final safe = index.clamp(0, items.length - 1);
     setState(() => i = safe);
     _activateSlideForIndex(safe);
+    final entry = items[safe];
+    final fast = entry.slideshowImageUrl;
+    final hd = entry.hdurl;
+    if (fast != null &&
+        hd != null &&
+        hd.trim().isNotEmpty &&
+        hd != fast &&
+        !_hdUpgradeReadyUrls.contains(hd)) {
+      unawaited(_primeHdUpgrade(entry));
+    }
     unawaited(_syncSlidingCacheForIndex(safe, reason: 'step'));
   }
 
   void _activateSlideForIndex(int index) {
-    final items = ref.read(slideshowEntriesProvider);
+    final items = _playableItems();
     if (items.isEmpty) return;
     final entry = items[index];
     final key =
@@ -311,7 +353,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final items = ref.watch(slideshowEntriesProvider);
+    final items = _playableItems(ref.watch(slideshowEntriesProvider));
     final elapsed = DateTime.now().difference(_startedAt);
     final remaining = widget.runDuration - elapsed;
     final remainingText = remaining.isNegative
@@ -320,20 +362,26 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
 
     if (items.isEmpty) {
       return const CosmicScaffold(
-        child: Center(child: Text('No slideshow items')),
+        child: Center(child: Text('No slideshow items (videos are skipped)')),
       );
     }
 
     if (!_initialVisualReady) {
       return CosmicScaffold(
         child: _spaceLoadingScreen(
-          context,
           message: 'Preparing the next cosmic view...',
         ),
       );
     }
 
-    final ApodEntry e = items[i];
+    final safeIndex = i.clamp(0, items.length - 1);
+    if (safeIndex != i) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        setState(() => i = safeIndex);
+      });
+    }
+    final ApodEntry e = items[safeIndex];
 
     return CosmicScaffold(
       padding: EdgeInsets.zero,
@@ -352,6 +400,16 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
                   child: _buildSlideContent(e),
                 ),
               ),
+              if (_prefetchTargetCount > 0)
+                Positioned(
+                  top: 14,
+                  right: 14,
+                  child: SpaceProgressBadge(
+                    current: _prefetchReadyCount,
+                    total: _prefetchTargetCount,
+                    label: 'Prefetched',
+                  ),
+                ),
               Positioned(
                 right: 14,
                 bottom: _controlsVisible ? 86 : 14,
@@ -408,7 +466,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
                       ),
                       IconButton(
                         onPressed: () {
-                          final items = ref.read(slideshowEntriesProvider);
+                          final items = _playableItems();
                           if (items.isEmpty) return;
                           _goToIndex(
                             ((i - 1 + items.length) % items.length).toInt(),
@@ -476,29 +534,54 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   }
 
   Widget _buildImageSlide(ApodEntry entry) {
-    final imageUrl = entry.bestImageUrl;
+    final hdFallbackUrl = entry.bestImageUrl;
+    final imageUrl = _effectiveSlideImageUrl(entry);
     if (imageUrl == null || imageUrl.trim().isEmpty) {
       _skipCurrentIfPossible(entry, reason: 'missing-image-url');
-      return _spaceLoadingScreen(
-        context,
-        message: 'Image unavailable for this entry.',
-      );
+      return _spaceLoadingScreen(message: 'Image unavailable for this entry.');
     }
 
     return CachedNetworkImage(
-      key: ValueKey('img_${entry.date.toIso8601String()}'),
+      key: ValueKey('img_${entry.date.toIso8601String()}_$imageUrl'),
       imageUrl: imageUrl,
       fit: BoxFit.cover,
-      placeholder: (_, _) =>
-          _spaceLoadingScreen(context, message: 'Loading image...'),
+      placeholder: (_, _) => _spaceLoadingScreen(message: 'Loading image...'),
       errorWidget: (_, _, _) {
+        if (hdFallbackUrl != null &&
+            hdFallbackUrl.trim().isNotEmpty &&
+            hdFallbackUrl != imageUrl) {
+          return CachedNetworkImage(
+            imageUrl: hdFallbackUrl,
+            fit: BoxFit.cover,
+            placeholder: (_, _) =>
+                _spaceLoadingScreen(message: 'Loading fallback...'),
+            errorWidget: (_, _, _) {
+              _skipCurrentIfPossible(entry, reason: 'image-fallback-failed');
+              return _spaceLoadingScreen(
+                message: 'Unable to render this image. Skipping…',
+              );
+            },
+          );
+        }
         _skipCurrentIfPossible(entry, reason: 'image-render-failed');
         return _spaceLoadingScreen(
-          context,
           message: 'Unable to render this image. Skipping…',
         );
       },
     );
+  }
+
+  String? _effectiveSlideImageUrl(ApodEntry entry) {
+    final fast = entry.slideshowImageUrl;
+    if (fast == null || fast.trim().isEmpty) return entry.bestImageUrl;
+    final hd = entry.hdurl;
+    if (hd != null &&
+        hd.trim().isNotEmpty &&
+        hd != fast &&
+        _hdUpgradeReadyUrls.contains(hd)) {
+      return hd;
+    }
+    return fast;
   }
 
   void _skipCurrentIfPossible(ApodEntry entry, {required String reason}) {
@@ -507,8 +590,9 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     _failedImageSlides.add(key);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      final items = ref.read(slideshowEntriesProvider);
+      final items = _playableItems();
       if (items.length <= 1) return;
+      if (i < 0 || i >= items.length) return;
       if (items[i].date != entry.date) return;
       _advanceToNext();
     });
@@ -544,7 +628,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
           ),
         );
       }
-      return _spaceLoadingScreen(context, message: 'Preparing video...');
+      return _spaceLoadingScreen(message: 'Preparing video...');
     }
 
     return _buildPreviewFallback(
@@ -601,10 +685,16 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
                     imageUrl: previewUrl,
                     height: 220,
                     fit: BoxFit.cover,
-                    placeholder: (_, _) =>
-                        const SizedBox(height: 220, width: 360),
-                    errorWidget: (_, _, _) =>
-                        const SizedBox(height: 220, width: 360),
+                    placeholder: (_, _) => const SpaceImagePlaceholder(
+                      height: 220,
+                      width: 360,
+                      showIndicator: false,
+                    ),
+                    errorWidget: (_, _, _) => const SpaceImagePlaceholder(
+                      height: 220,
+                      width: 360,
+                      showIndicator: false,
+                    ),
                   ),
                 )
               else
@@ -630,8 +720,8 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   }
 
   String? _previewUrlForCaching(ApodEntry entry) {
-    if (entry.shouldRenderAsImage && entry.bestImageUrl != null) {
-      return entry.bestImageUrl;
+    if (entry.shouldRenderAsImage && entry.slideshowImageUrl != null) {
+      return entry.slideshowImageUrl;
     }
     if (entry.thumbnailUrl != null && entry.thumbnailUrl!.trim().isNotEmpty) {
       return entry.thumbnailUrl;
@@ -647,6 +737,47 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
       return 'https://img.youtube.com/vi/$youtubeId/hqdefault.jpg';
     }
     return null;
+  }
+
+  Future<void> _primeHdUpgrade(ApodEntry entry) async {
+    final hd = entry.hdurl;
+    final fast = entry.slideshowImageUrl;
+    if (hd == null || hd.trim().isEmpty || hd == fast) return;
+    if (_hdUpgradeReadyUrls.contains(hd) ||
+        _hdUpgradeInFlightUrls.contains(hd)) {
+      return;
+    }
+    _hdUpgradeInFlightUrls.add(hd);
+    try {
+      final cache = ref.read(cacheServiceProvider).imageCache;
+      final cached = await cache.getFileFromCache(hd);
+      if (cached == null) {
+        await cache.downloadFile(hd);
+      }
+      _hdUpgradeReadyUrls.add(hd);
+      if (mounted) setState(() {});
+    } catch (_) {
+      // Keep slideshow smooth even if HD upgrade fails.
+    } finally {
+      _hdUpgradeInFlightUrls.remove(hd);
+    }
+  }
+
+  Future<void> _refreshPrefetchStatus(Set<String> urls) async {
+    final cache = ref.read(cacheServiceProvider).imageCache;
+    final checks = await Future.wait(
+      urls.map((url) => cache.getFileFromCache(url)),
+      eagerError: false,
+    );
+    var ready = 0;
+    for (final cached in checks) {
+      if (cached != null) ready++;
+    }
+    if (!mounted) return;
+    setState(() {
+      _prefetchTargetCount = urls.length;
+      _prefetchReadyCount = ready;
+    });
   }
 
   String? _providerPreviewFromLaunch(String launch) {
@@ -745,34 +876,10 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     return null;
   }
 
-  Widget _spaceLoadingScreen(BuildContext context, {required String message}) {
-    return Container(
-      decoration: const BoxDecoration(
-        gradient: RadialGradient(
-          center: Alignment(0.1, -0.3),
-          radius: 1.2,
-          colors: [Color(0xFF132040), Color(0xFF090F1E), Color(0xFF050912)],
-        ),
-      ),
-      child: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(
-              Icons.auto_awesome,
-              color: AppTheme.accentSoft,
-              size: 46,
-            ),
-            const SizedBox(height: 12),
-            Text(
-              message,
-              style: Theme.of(
-                context,
-              ).textTheme.bodyLarge?.copyWith(color: Colors.white70),
-            ),
-          ],
-        ),
-      ),
+  Widget _spaceLoadingScreen({required String message}) {
+    return SpaceLoadingSurface(
+      message: message,
+      size: SpaceIndicatorSize.large,
     );
   }
 

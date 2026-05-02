@@ -4,6 +4,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 import '../models/apod_entry.dart';
 import '../ui/app_theme.dart';
+import 'space_loading.dart';
 
 /// Hero-style APOD media surface used as the centerpiece on the home screen.
 class ApodCard extends StatelessWidget {
@@ -81,14 +82,9 @@ class ApodCard extends StatelessWidget {
       return _networkImage(
         entry.bestImageUrl!,
         fit: BoxFit.cover,
-        placeholder: const ColoredBox(
-          color: Color(0xFF0E1A2F),
-          child: Center(
-            child: Text(
-              'Loading image...',
-              style: TextStyle(color: Colors.white70),
-            ),
-          ),
+        placeholder: const SpaceImagePlaceholder(
+          message: 'Loading image...',
+          indicatorSize: SpaceIndicatorSize.small,
         ),
         errorWidget: const Center(child: Icon(Icons.broken_image_outlined)),
       );
@@ -102,8 +98,8 @@ class ApodCard extends StatelessWidget {
           _networkImage(
             thumb,
             fit: BoxFit.cover,
-            placeholder: const ColoredBox(color: AppTheme.panel),
-            errorWidget: const ColoredBox(color: AppTheme.panel),
+            placeholder: const SpaceImagePlaceholder(showIndicator: false),
+            errorWidget: const SpaceImagePlaceholder(showIndicator: false),
           )
         else
           const ColoredBox(color: AppTheme.panel),

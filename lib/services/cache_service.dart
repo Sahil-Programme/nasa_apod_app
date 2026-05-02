@@ -93,9 +93,10 @@ class CacheService {
       'SYNC reason=$reason keep=${desired.length} add=${add.length} purge=${purge.length}',
     );
 
-    for (final url in add) {
-      await _cacheUrl(url, reason: '$reason:add');
-    }
+    await Future.wait(
+      add.map((url) => _cacheUrl(url, reason: '$reason:add')),
+      eagerError: false,
+    );
     for (final url in purge) {
       await _purgeUrl(url, reason: '$reason:purge');
     }

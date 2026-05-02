@@ -67,6 +67,9 @@ class ApodEntry {
   /// Best-effort display image URL preference.
   String? get bestImageUrl => hdurl ?? url ?? thumbnailUrl;
 
+  /// Slideshow-optimized image source (prefer non-HD for faster first paint).
+  String? get slideshowImageUrl => url ?? hdurl ?? thumbnailUrl;
+
   String? get primaryUrl => url ?? hdurl ?? thumbnailUrl;
 
   String? get launchUrl => primaryUrl;

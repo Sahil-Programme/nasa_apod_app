@@ -5,6 +5,7 @@ import 'package:url_launcher/url_launcher.dart';
 import '../providers/app_providers.dart';
 import '../ui/app_theme.dart';
 import '../ui/cosmic_scaffold.dart';
+import '../widgets/space_loading.dart';
 
 /// First-run onboarding for collecting and validating NASA API credentials.
 class OnboardingApiKeyScreen extends ConsumerStatefulWidget {
@@ -106,7 +107,10 @@ class _OnboardingApiKeyScreenState
                           ? const SizedBox(
                               height: 18,
                               width: 18,
-                              child: CircularProgressIndicator(strokeWidth: 2),
+                              child: SpaceLoadingIndicator(
+                                size: SpaceIndicatorSize.tiny,
+                                semanticLabel: 'Validating API key',
+                              ),
                             )
                           : const Text('Validate & Save Key'),
                     ),

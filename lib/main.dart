@@ -6,6 +6,7 @@ import 'providers/app_providers.dart';
 import 'screens/home_screen.dart';
 import 'screens/onboarding_api_key_screen.dart';
 import 'ui/app_theme.dart';
+import 'widgets/space_loading.dart';
 
 /// Application entrypoint.
 ///
@@ -63,7 +64,12 @@ class _NasaApodExplorerAppState extends ConsumerState<NasaApodExplorerApp> {
       debugShowCheckedModeBanner: false,
       theme: AppTheme.dark,
       home: !_ready
-          ? const Scaffold(body: Center(child: CircularProgressIndicator()))
+          ? const Scaffold(
+              body: SpaceLoadingSurface(
+                message: 'Preparing mission control...',
+                size: SpaceIndicatorSize.small,
+              ),
+            )
           : ref.watch(apiKeyProvider) == null
           ? const OnboardingApiKeyScreen()
           : const HomeScreen(),

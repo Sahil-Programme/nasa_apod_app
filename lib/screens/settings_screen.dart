@@ -10,7 +10,7 @@ class SettingsScreen extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final interval = ref.watch(slideshowIntervalProvider);
+    final interval = ref.watch(slideshowIntervalProvider).clamp(8, 300);
     final precache = ref.watch(precacheWindowProvider);
 
     return CosmicScaffold(
@@ -50,15 +50,18 @@ class SettingsScreen extends ConsumerWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('Slideshow Interval: ${interval}s'),
+                  Text(
+                    'Slideshow Interval: ${interval}s (${(interval / 60).toStringAsFixed(interval >= 60 ? 1 : 2)} min)',
+                  ),
                   Slider(
                     value: interval.toDouble(),
-                    min: 1,
-                    max: 20,
-                    divisions: 19,
+                    min: 8,
+                    max: 300,
+                    divisions: 292,
                     onChanged: (v) =>
                         ref.read(slideshowIntervalProvider.notifier).state = v
-                            .round(),
+                            .round()
+                            .clamp(8, 300),
                   ),
                   const SizedBox(height: 8),
                   Text('Pre-cache Window: $precache item(s)'),

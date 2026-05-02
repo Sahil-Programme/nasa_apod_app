@@ -281,7 +281,7 @@ void main() {
     expect(container.read(currentEntryProvider).hasError, isTrue);
   });
 
-  testWidgets('slideshow waits for cache fill before first auto-advance', (
+  testWidgets('slideshow stays responsive while cache sync is pending', (
     tester,
   ) async {
     final cache = _GateCacheService();
@@ -328,7 +328,7 @@ void main() {
 
     cache.syncCompleter.complete();
     await tester.pump();
-    await tester.pump(const Duration(seconds: 2));
+    await tester.pump(const Duration(seconds: 10));
     expect(cache.syncCallCount, greaterThan(1));
   });
 
