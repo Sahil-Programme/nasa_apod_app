@@ -78,10 +78,10 @@ class ApodCard extends StatelessWidget {
   /// Draws image media or a video thumbnail with "Open Video" CTA.
   Widget _buildMedia(BuildContext context) {
     if (entry.shouldRenderAsImage && entry.bestImageUrl != null) {
-      return CachedNetworkImage(
-        imageUrl: entry.bestImageUrl!,
+      return _networkImage(
+        entry.bestImageUrl!,
         fit: BoxFit.cover,
-        placeholder: (_, _) => const ColoredBox(
+        placeholder: const ColoredBox(
           color: Color(0xFF0E1A2F),
           child: Center(
             child: Text(
@@ -90,8 +90,7 @@ class ApodCard extends StatelessWidget {
             ),
           ),
         ),
-        errorWidget: (_, _, _) =>
-            const Center(child: Icon(Icons.broken_image_outlined)),
+        errorWidget: const Center(child: Icon(Icons.broken_image_outlined)),
       );
     }
 
@@ -100,11 +99,11 @@ class ApodCard extends StatelessWidget {
       fit: StackFit.expand,
       children: [
         if (thumb != null)
-          CachedNetworkImage(
-            imageUrl: thumb,
+          _networkImage(
+            thumb,
             fit: BoxFit.cover,
-            placeholder: (_, _) => const ColoredBox(color: AppTheme.panel),
-            errorWidget: (_, _, _) => const ColoredBox(color: AppTheme.panel),
+            placeholder: const ColoredBox(color: AppTheme.panel),
+            errorWidget: const ColoredBox(color: AppTheme.panel),
           )
         else
           const ColoredBox(color: AppTheme.panel),
@@ -213,6 +212,20 @@ class ApodCard extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+
+  Widget _networkImage(
+    String imageUrl, {
+    required BoxFit fit,
+    required Widget placeholder,
+    required Widget errorWidget,
+  }) {
+    return CachedNetworkImage(
+      imageUrl: imageUrl,
+      fit: fit,
+      placeholder: (_, _) => placeholder,
+      errorWidget: (_, _, _) => errorWidget,
     );
   }
 }

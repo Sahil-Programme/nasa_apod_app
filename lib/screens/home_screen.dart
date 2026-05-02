@@ -32,10 +32,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   // APOD allows 1000 requests/hour, but slideshow playback uses range fetches.
   // This cap prevents oversized range payloads and keeps startup responsive.
   static const _maxSlideshowItems = 1000; // APOD API limit
+  static const _startupImageRollbackDays = 7;
 
   Timer? _hideTimer;
   bool _controlsVisible = true;
   bool _infoPanelVisible = true;
+  bool _startupLoadScheduled = false;
   DateTime _lastPointerWake = DateTime.fromMillisecondsSinceEpoch(0);
   DateTime get _maxApodDate {
     final nowUtc = DateTime.now().toUtc();
@@ -64,6 +66,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         child: Center(child: CircularProgressIndicator()),
       );
     }
+    _ensureStartupEntryLoaded(key, current);
 
     return CosmicScaffold(
       child: Listener(
@@ -143,6 +146,76 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         ),
       ),
     );
+  }
+
+  void _ensureStartupEntryLoaded(
+    String apiKey,
+    AsyncValue<ApodEntry?> current,
+  ) {
+    if (_startupLoadScheduled) return;
+    if (current.isLoading) return;
+    if (current.valueOrNull != null) {
+      _startupLoadScheduled = true;
+      return;
+    }
+    _startupLoadScheduled = true;
+    Future.microtask(() => _loadLatestDisplayableImage(apiKey));
+  }
+
+  Future<void> _loadLatestDisplayableImage(String apiKey) async {
+    ref.read(currentEntryProvider.notifier).state = const AsyncLoading();
+    final latestAvailableDate = await _resolveLatestAvailableDate(apiKey);
+    for (var offset = 0; offset < _startupImageRollbackDays; offset++) {
+      final date = latestAvailableDate.subtract(Duration(days: offset));
+      try {
+        final entry = offset == 0
+            ? await ref.read(nasaApiServiceProvider).fetchToday(apiKey)
+            : await ref.read(nasaApiServiceProvider).fetchByDate(apiKey, date);
+        if (_isDisplayableStartupImage(entry)) {
+          ref.read(currentEntryProvider.notifier).state = AsyncData(entry);
+          unawaited(
+            ref
+                .read(cacheServiceProvider)
+                .warmEntry(entry, reason: 'home_startup'),
+          );
+          return;
+        }
+      } catch (_) {
+        // Keep searching previous days for a displayable image.
+      }
+    }
+    ref.read(currentEntryProvider.notifier).state = AsyncError(
+      StateError(
+        'No displayable APOD image found in the last $_startupImageRollbackDays day(s). Try Date or Random.',
+      ),
+      StackTrace.current,
+    );
+  }
+
+  bool _isDisplayableStartupImage(ApodEntry entry) {
+    final url = entry.bestImageUrl;
+    if (!entry.shouldRenderAsImage || url == null || url.trim().isEmpty) {
+      return false;
+    }
+    final lower = Uri.tryParse(url)?.path.toLowerCase() ?? url.toLowerCase();
+    const blocked = <String>{
+      '.mp4',
+      '.mov',
+      '.m4v',
+      '.webm',
+      '.mkv',
+      '.avi',
+      '.mp3',
+      '.wav',
+      '.ogg',
+      '.m4a',
+      '.flac',
+      '.aac',
+      '.html',
+      '.htm',
+      '.pdf',
+    };
+    return !blocked.any(lower.endsWith);
   }
 
   /// Tracks user activity and re-arms auto-hide for the top controls.

@@ -41,6 +41,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   late final DateTime _startedAt;
   bool _controlsVisible = true;
   bool _initialVisualReady = false;
+  bool _startupCacheReady = false;
   DateTime _lastPointerWake = DateTime.fromMillisecondsSinceEpoch(0);
 
   VideoPlayerController? _videoController;
@@ -50,6 +51,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   bool _awaitingVideoCompletion = false;
   String? _activeSlideKey;
   String? _videoStateNote;
+  final Set<String> _failedImageSlides = <String>{};
   final Map<String, String?> _resolvedLaunchPreview = <String, String?>{};
   final Set<String> _previewResolveInFlight = <String>{};
 
@@ -78,8 +80,14 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
 
     setState(() => _initialVisualReady = true);
     _activateSlideForIndex(0);
-    _tick();
-    unawaited(_syncSlidingCacheForIndex(0, reason: 'bootstrap'));
+    try {
+      await _syncSlidingCacheForIndex(0, reason: 'bootstrap');
+    } finally {
+      if (mounted) {
+        setState(() => _startupCacheReady = true);
+        _tick();
+      }
+    }
   }
 
   Future<void> _prepareInitialVisual(ApodEntry entry) async {
@@ -121,6 +129,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     t = Timer.periodic(Duration(seconds: ref.read(slideshowIntervalProvider)), (
       _,
     ) {
+      if (!_startupCacheReady) return;
       if (DateTime.now().difference(_startedAt) >= widget.runDuration) {
         setState(() => playing = false);
         t?.cancel();
@@ -469,6 +478,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   Widget _buildImageSlide(ApodEntry entry) {
     final imageUrl = entry.bestImageUrl;
     if (imageUrl == null || imageUrl.trim().isEmpty) {
+      _skipCurrentIfPossible(entry, reason: 'missing-image-url');
       return _spaceLoadingScreen(
         context,
         message: 'Image unavailable for this entry.',
@@ -481,9 +491,27 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
       fit: BoxFit.cover,
       placeholder: (_, _) =>
           _spaceLoadingScreen(context, message: 'Loading image...'),
-      errorWidget: (_, _, _) =>
-          _spaceLoadingScreen(context, message: 'Unable to render this image.'),
+      errorWidget: (_, _, _) {
+        _skipCurrentIfPossible(entry, reason: 'image-render-failed');
+        return _spaceLoadingScreen(
+          context,
+          message: 'Unable to render this image. Skipping…',
+        );
+      },
     );
+  }
+
+  void _skipCurrentIfPossible(ApodEntry entry, {required String reason}) {
+    final key = '${entry.date.toIso8601String()}|$reason';
+    if (_failedImageSlides.contains(key)) return;
+    _failedImageSlides.add(key);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final items = ref.read(slideshowEntriesProvider);
+      if (items.length <= 1) return;
+      if (items[i].date != entry.date) return;
+      _advanceToNext();
+    });
   }
 
   Widget _buildVideoSlide(ApodEntry entry) {
