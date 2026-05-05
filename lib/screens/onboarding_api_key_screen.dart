@@ -88,16 +88,22 @@ class _OnboardingApiKeyScreenState
                                 loading = true;
                                 error = null;
                               });
+                              final key = c.text.trim();
+                              final api = ref.read(nasaApiServiceProvider);
+                              final keyService = ref.read(
+                                apiKeyServiceProvider,
+                              );
+                              final apiKeyNotifier = ref.read(
+                                apiKeyProvider.notifier,
+                              );
                               try {
-                                await ref
-                                    .read(nasaApiServiceProvider)
-                                    .validateApiKey(c.text.trim());
-                                await ref
-                                    .read(apiKeyServiceProvider)
-                                    .save(c.text.trim());
-                                ref.read(apiKeyProvider.notifier).state = c.text
-                                    .trim();
+                                await api.validateApiKey(key);
+                                if (!mounted) return;
+                                await keyService.save(key);
+                                if (!mounted) return;
+                                apiKeyNotifier.state = key;
                               } catch (e) {
+                                if (!mounted) return;
                                 setState(() => error = e.toString());
                               } finally {
                                 if (mounted) setState(() => loading = false);

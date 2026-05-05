@@ -1,13 +1,15 @@
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../models/apod_entry.dart';
+import '../providers/app_providers.dart';
 import '../ui/app_theme.dart';
 import 'space_loading.dart';
 
 /// Hero-style APOD media surface used as the centerpiece on the home screen.
-class ApodCard extends StatelessWidget {
+class ApodCard extends ConsumerWidget {
   const ApodCard({
     super.key,
     required this.entry,
@@ -20,7 +22,8 @@ class ApodCard extends StatelessWidget {
   final bool showInfoPanel;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    final lowInternetUsage = ref.watch(lowInternetUsageModeProvider);
     return Container(
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(24),
@@ -43,7 +46,7 @@ class ApodCard extends StatelessWidget {
                   return Stack(
                     fit: StackFit.expand,
                     children: [
-                      _buildMedia(context),
+                      _buildMedia(context, lowInternetUsage: lowInternetUsage),
                       Positioned(
                         right: 14,
                         bottom: 12,
@@ -56,7 +59,13 @@ class ApodCard extends StatelessWidget {
                 if (isWide) {
                   return Row(
                     children: [
-                      Expanded(flex: 6, child: _buildMedia(context)),
+                      Expanded(
+                        flex: 6,
+                        child: _buildMedia(
+                          context,
+                          lowInternetUsage: lowInternetUsage,
+                        ),
+                      ),
                       Expanded(flex: 5, child: _buildInfoPanel(context, true)),
                     ],
                   );
@@ -64,7 +73,13 @@ class ApodCard extends StatelessWidget {
 
                 return Column(
                   children: [
-                    Expanded(flex: 6, child: _buildMedia(context)),
+                    Expanded(
+                      flex: 6,
+                      child: _buildMedia(
+                        context,
+                        lowInternetUsage: lowInternetUsage,
+                      ),
+                    ),
                     Expanded(flex: 5, child: _buildInfoPanel(context, false)),
                   ],
                 );
@@ -77,10 +92,11 @@ class ApodCard extends StatelessWidget {
   }
 
   /// Draws image media or a video thumbnail with "Open Video" CTA.
-  Widget _buildMedia(BuildContext context) {
-    if (entry.shouldRenderAsImage && entry.bestImageUrl != null) {
+  Widget _buildMedia(BuildContext context, {required bool lowInternetUsage}) {
+    final imageUrl = entry.imageUrlFor(lowInternetUsage: lowInternetUsage);
+    if (entry.shouldRenderAsImage && imageUrl != null) {
       return _networkImage(
-        entry.bestImageUrl!,
+        imageUrl,
         fit: BoxFit.cover,
         placeholder: const SpaceImagePlaceholder(
           message: 'Loading image...',

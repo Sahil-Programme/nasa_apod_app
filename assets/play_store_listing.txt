@@ -1,0 +1,21 @@
+Short Description (<=80)
+Explore NASA's APOD with slideshows, videos, and one-tap wallpapers.
+
+Full Description (<=4000)
+Stellar Lens helps you discover space every day through NASA's Astronomy Picture of the Day (APOD).
+
+Browse today's featured image, jump to any date, or explore random APOD entries to find incredible photos, deep-sky captures, and fascinating astronomy stories. Each entry includes the original NASA explanation so you can learn the science behind what you see.
+
+Key features:
+- Daily APOD discovery with date picker and random mode
+- Immersive slideshow mode for uninterrupted space viewing
+- Inline media support for APOD videos and mixed media posts
+- Wallpaper tools to set your favorite APOD as your device wallpaper
+- Built-in image framing flow to zoom and position wallpapers before applying
+- Cache support for smoother browsing and quicker reloads
+- Low Internet Usage mode for lighter image loading
+
+Stellar Lens is designed for people who love astronomy, photography, and learning something new about the universe in just a few minutes each day.
+
+Note:
+Stellar Lens is an independent app that uses NASA's public APOD API.

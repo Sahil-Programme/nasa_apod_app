@@ -1,17 +1,23 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../providers/app_providers.dart';
+import 'about_me_screen.dart';
 import '../ui/cosmic_scaffold.dart';
 
 /// App-level configuration screen for key lifecycle, cache, and slideshow tuning.
 class SettingsScreen extends ConsumerWidget {
   const SettingsScreen({super.key});
 
+  static final Uri _privacyPolicy = Uri.parse(
+    'https://stellar-lens-privacy.netlify.app/',
+  );
+
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final interval = ref.watch(slideshowIntervalProvider).clamp(8, 300);
-    final precache = ref.watch(precacheWindowProvider);
+    final lowInternetUsage = ref.watch(lowInternetUsageModeProvider);
 
     return CosmicScaffold(
       appBar: AppBar(title: const Text('Settings')),
@@ -43,6 +49,39 @@ class SettingsScreen extends ConsumerWidget {
               }
             },
           ),
+          const SizedBox(height: 10),
+          _tile(
+            context,
+            title: 'Privacy Policy',
+            subtitle: 'How Stellar Lens handles your data',
+            icon: Icons.privacy_tip_outlined,
+            onTap: () async {
+              final launched = await launchUrl(
+                _privacyPolicy,
+                mode: LaunchMode.externalApplication,
+              );
+              if (!launched && context.mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('Could not open privacy policy'),
+                  ),
+                );
+              }
+            },
+          ),
+          const SizedBox(height: 10),
+          _tile(
+            context,
+            title: 'About Me',
+            subtitle: 'Personal profile and website',
+            icon: Icons.person_outline,
+            onTap: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const AboutMeScreen()),
+              );
+            },
+          ),
           const SizedBox(height: 14),
           Card(
             child: Padding(
@@ -50,6 +89,19 @@ class SettingsScreen extends ConsumerWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Low Internet Usage Mode'),
+                    subtitle: const Text(
+                      'Use standard APOD images instead of HD',
+                    ),
+                    secondary: const Icon(Icons.data_saver_on_outlined),
+                    value: lowInternetUsage,
+                    onChanged: (value) =>
+                        ref.read(lowInternetUsageModeProvider.notifier).state =
+                            value,
+                  ),
+                  const SizedBox(height: 12),
                   Text(
                     'Slideshow Interval: ${interval}s (${(interval / 60).toStringAsFixed(interval >= 60 ? 1 : 2)} min)',
                   ),
@@ -62,17 +114,6 @@ class SettingsScreen extends ConsumerWidget {
                         ref.read(slideshowIntervalProvider.notifier).state = v
                             .round()
                             .clamp(8, 300),
-                  ),
-                  const SizedBox(height: 8),
-                  Text('Pre-cache Window: $precache item(s)'),
-                  Slider(
-                    value: precache.toDouble(),
-                    min: 5,
-                    max: 15,
-                    divisions: 10,
-                    onChanged: (v) =>
-                        ref.read(precacheWindowProvider.notifier).state = v
-                            .round(),
                   ),
                 ],
               ),

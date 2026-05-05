@@ -13,6 +13,9 @@ val keystorePropertiesFile = rootProject.file("key.properties")
 if (keystorePropertiesFile.exists()) {
     keystoreProperties.load(FileInputStream(keystorePropertiesFile))
 }
+val hasReleaseSigning = listOf("keyAlias", "keyPassword", "storeFile", "storePassword")
+    .all { (keystoreProperties[it] as String?)?.isNotBlank() == true }
+
 
 android {
     namespace = "com.iamsahilyadav.stellarlens"
@@ -37,8 +40,8 @@ android {
     }
 
     signingConfigs {
-        create("release") {
-            if (keystorePropertiesFile.exists()) {
+        if (hasReleaseSigning) {
+            create("release") {
                 keyAlias = keystoreProperties["keyAlias"] as String
                 keyPassword = keystoreProperties["keyPassword"] as String
                 storeFile = file(keystoreProperties["storeFile"] as String)
@@ -49,17 +52,24 @@ android {
 
     buildTypes {
         release {
-            signingConfig = if (keystorePropertiesFile.exists()) {
-                signingConfigs.getByName("release")
-            } else {
-                signingConfigs.getByName("debug")
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
             }
-            isMinifyEnabled = false
-            isShrinkResources = false
+            isMinifyEnabled = true
+            isShrinkResources = true
         }
     }
 }
 
 flutter {
     source = "../.."
+}
+
+gradle.taskGraph.whenReady {
+    val releaseRequested = allTasks.any { it.name.contains("Release") }
+    if (releaseRequested && !hasReleaseSigning) {
+        throw GradleException(
+            "Release signing is not configured. Copy android/key.properties.example to android/key.properties and fill in a real upload keystore."
+        )
+    }
 }

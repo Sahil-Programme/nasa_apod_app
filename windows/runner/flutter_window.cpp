@@ -10,8 +10,8 @@
 #include "flutter/generated_plugin_registrant.h"
 
 namespace {
-constexpr int kMinWindowWidth = 1280;
-constexpr int kMinWindowHeight = 720;
+constexpr int kMinWindowWidth = 960;
+constexpr int kMinWindowHeight = 540;
 
 bool Utf16FromUtf8(const std::string& utf8, std::wstring* out) {
   if (utf8.empty() || out == nullptr) {
@@ -78,6 +78,30 @@ bool SetWindowsWallpaper(const std::string& path, const std::string& style) {
       SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
 }
 
+bool GetCurrentMonitorPixelSize(HWND hwnd, int* out_width, int* out_height) {
+  if (out_width == nullptr || out_height == nullptr) {
+    return false;
+  }
+  HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+  if (monitor == nullptr) {
+    return false;
+  }
+  MONITORINFO monitor_info;
+  monitor_info.cbSize = sizeof(MONITORINFO);
+  if (!GetMonitorInfoW(monitor, &monitor_info)) {
+    return false;
+  }
+  const RECT bounds = monitor_info.rcMonitor;
+  const int width = bounds.right - bounds.left;
+  const int height = bounds.bottom - bounds.top;
+  if (width <= 0 || height <= 0) {
+    return false;
+  }
+  *out_width = width;
+  *out_height = height;
+  return true;
+}
+
 }  // namespace
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
@@ -123,9 +147,30 @@ void FlutterWindow::RegisterWallpaperChannel() {
           &flutter::StandardMethodCodec::GetInstance());
 
   wallpaper_channel_->SetMethodCallHandler(
-      [](const flutter::MethodCall<flutter::EncodableValue>& method_call,
+      [this](const flutter::MethodCall<flutter::EncodableValue>& method_call,
          std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
              result) {
+        if (method_call.method_name() == "getWallpaperTargetSize") {
+          int width = 0;
+          int height = 0;
+          HWND hwnd = nullptr;
+          if (flutter_controller_ && flutter_controller_->view()) {
+            hwnd = flutter_controller_->view()->GetNativeWindow();
+          }
+          if (hwnd == nullptr ||
+              !GetCurrentMonitorPixelSize(hwnd, &width, &height)) {
+            width = GetSystemMetrics(SM_CXSCREEN);
+            height = GetSystemMetrics(SM_CYSCREEN);
+          }
+          flutter::EncodableMap response{
+              {flutter::EncodableValue("widthPx"), flutter::EncodableValue(width)},
+              {flutter::EncodableValue("heightPx"),
+               flutter::EncodableValue(height)},
+          };
+          result->Success(flutter::EncodableValue(response));
+          return;
+        }
+
         if (method_call.method_name() != "setWallpaper") {
           result->NotImplemented();
           return;

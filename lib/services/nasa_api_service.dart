@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:http/http.dart' as http;
@@ -6,10 +7,28 @@ import '../models/apod_entry.dart';
 
 enum ApodDateSearchDirection { backward, forward, nearest }
 
+enum NasaApiFailureKind {
+  auth,
+  rateLimit,
+  network,
+  server,
+  invalidResponse,
+  other,
+}
+
 /// Typed API exception surfaced to UI for user-friendly handling.
 class NasaApiException implements Exception {
-  const NasaApiException(this.message);
+  const NasaApiException(this.message, {this.kind = NasaApiFailureKind.other});
   final String message;
+  final NasaApiFailureKind kind;
+
+  bool get shouldAbortDateSearch => switch (kind) {
+    NasaApiFailureKind.auth ||
+    NasaApiFailureKind.rateLimit ||
+    NasaApiFailureKind.network ||
+    NasaApiFailureKind.server => true,
+    NasaApiFailureKind.invalidResponse || NasaApiFailureKind.other => false,
+  };
 
   @override
   String toString() => message;
@@ -18,6 +37,7 @@ class NasaApiException implements Exception {
 /// NASA APOD REST client.
 class NasaApiService {
   static const _base = 'https://api.nasa.gov/planetary/apod';
+  static const _requestTimeout = Duration(seconds: 15);
   static final DateTime firstApodDate = DateTime(1995, 6, 16);
 
   /// Validates credentials by issuing a minimal APOD request.
@@ -83,6 +103,9 @@ class NasaApiService {
     for (final date in candidates) {
       try {
         return await fetchByDate(key, date);
+      } on NasaApiException catch (e) {
+        if (e.shouldAbortDateSearch) rethrow;
+        lastError = e;
       } catch (e) {
         lastError = e;
       }
@@ -113,7 +136,14 @@ class NasaApiService {
   /// Executes a single-object APOD request and maps known API-level errors.
   Future<ApodEntry> _fetchOne(String key, Map<String, String> q) async {
     final res = await _call(key, q);
-    final body = jsonDecode(res.body) as Map<String, dynamic>;
+    final decoded = _decodeResponseBody(res.body);
+    if (decoded is! Map<String, dynamic>) {
+      throw const NasaApiException(
+        'NASA API returned an unexpected response.',
+        kind: NasaApiFailureKind.invalidResponse,
+      );
+    }
+    final body = decoded;
     if (body['code'] != null) {
       throw NasaApiException('${body['msg'] ?? 'API error'}');
     }
@@ -123,14 +153,20 @@ class NasaApiService {
   /// Executes a list-capable APOD request and normalizes both object/list payloads.
   Future<List<ApodEntry>> _fetchMany(String key, Map<String, String> q) async {
     final res = await _call(key, q);
-    final decoded = jsonDecode(res.body);
+    final decoded = _decodeResponseBody(res.body);
     if (decoded is Map<String, dynamic>) {
       if (decoded['code'] != null) {
         throw NasaApiException('${decoded['msg'] ?? 'API error'}');
       }
       return [ApodEntry.fromJson(decoded)];
     }
-    return (decoded as List)
+    if (decoded is! List) {
+      throw const NasaApiException(
+        'NASA API returned an unexpected response.',
+        kind: NasaApiFailureKind.invalidResponse,
+      );
+    }
+    return decoded
         .map((e) => ApodEntry.fromJson(e as Map<String, dynamic>))
         .toList();
   }
@@ -141,32 +177,71 @@ class NasaApiService {
       _base,
     ).replace(queryParameters: {'api_key': key, 'thumbs': 'true', ...q});
 
-    final res = await http.get(uri);
+    late final http.Response res;
+    try {
+      res = await http.get(uri).timeout(_requestTimeout);
+    } on TimeoutException {
+      throw const NasaApiException(
+        'NASA API request timed out. Check your connection and try again.',
+        kind: NasaApiFailureKind.network,
+      );
+    } on http.ClientException catch (e) {
+      throw NasaApiException(
+        'Network request failed: ${e.message}',
+        kind: NasaApiFailureKind.network,
+      );
+    }
+
     if (res.statusCode == 429) {
-      throw const NasaApiException('NASA API rate limit reached (429).');
+      throw const NasaApiException(
+        'NASA API rate limit reached (429).',
+        kind: NasaApiFailureKind.rateLimit,
+      );
     }
     if (res.statusCode == 401 || res.statusCode == 403) {
-      throw const NasaApiException('Invalid API key.');
+      throw const NasaApiException(
+        'Invalid API key.',
+        kind: NasaApiFailureKind.auth,
+      );
     }
     if (res.statusCode >= 400) {
-      final body = res.body;
-      if (body.isNotEmpty) {
-        try {
-          final decoded = jsonDecode(body);
-          if (decoded is Map<String, dynamic>) {
-            final msg =
-                decoded['msg'] ?? decoded['error'] ?? decoded['message'];
-            if (msg != null && msg.toString().trim().isNotEmpty) {
-              throw NasaApiException(msg.toString());
-            }
-          }
-        } catch (_) {
-          // Fall back to status-based message when response is not JSON.
-        }
+      final message = _extractApiErrorMessage(res.body);
+      final kind = res.statusCode >= 500
+          ? NasaApiFailureKind.server
+          : NasaApiFailureKind.other;
+      if (message != null) {
+        throw NasaApiException(message, kind: kind);
       }
-      throw NasaApiException('Request failed (${res.statusCode}).');
+      throw NasaApiException('Request failed (${res.statusCode}).', kind: kind);
     }
     return res;
+  }
+
+  String? _extractApiErrorMessage(String body) {
+    if (body.isEmpty) return null;
+    try {
+      final decoded = jsonDecode(body);
+      if (decoded is Map<String, dynamic>) {
+        final msg = decoded['msg'] ?? decoded['error'] ?? decoded['message'];
+        if (msg != null && msg.toString().trim().isNotEmpty) {
+          return msg.toString();
+        }
+      }
+    } on FormatException {
+      return null;
+    }
+    return null;
+  }
+
+  Object? _decodeResponseBody(String body) {
+    try {
+      return jsonDecode(body);
+    } on FormatException {
+      throw const NasaApiException(
+        'NASA API returned invalid JSON.',
+        kind: NasaApiFailureKind.invalidResponse,
+      );
+    }
   }
 
   String _fmt(DateTime d) => d.toIso8601String().split('T').first;

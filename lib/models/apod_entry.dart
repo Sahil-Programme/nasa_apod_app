@@ -67,6 +67,12 @@ class ApodEntry {
   /// Best-effort display image URL preference.
   String? get bestImageUrl => hdurl ?? url ?? thumbnailUrl;
 
+  /// Non-HD image URL preference for low internet usage mode.
+  String? get standardImageUrl => url ?? thumbnailUrl;
+
+  String? imageUrlFor({required bool lowInternetUsage}) =>
+      lowInternetUsage ? standardImageUrl : bestImageUrl;
+
   /// Slideshow-optimized image source (prefer non-HD for faster first paint).
   String? get slideshowImageUrl => url ?? hdurl ?? thumbnailUrl;
 

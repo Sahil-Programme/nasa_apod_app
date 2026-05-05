@@ -13,29 +13,37 @@ import 'package:youtube_player_iframe/youtube_player_iframe.dart';
 import '../models/apod_entry.dart';
 import '../models/slideshow_config.dart';
 import '../providers/app_providers.dart';
+import '../services/cache_service.dart';
+import '../services/nasa_api_service.dart';
 import '../services/wallpaper_service.dart';
 import '../ui/app_theme.dart';
 import '../ui/cosmic_scaffold.dart';
 import '../widgets/space_loading.dart';
+import 'wallpaper_setup_overlay.dart';
 
-/// Fullscreen slideshow player for preloaded APOD entries.
+/// Fullscreen slideshow player for runtime directional APOD playback.
 class SlideshowScreen extends ConsumerStatefulWidget {
   const SlideshowScreen({
     super.key,
     required this.runDuration,
     required this.direction,
     required this.startDate,
+    required this.latestAvailableDate,
+    required this.initialEntry,
   });
 
   final Duration runDuration;
   final SlideshowDirection direction;
   final DateTime startDate;
+  final DateTime latestAvailableDate;
+  final ApodEntry initialEntry;
 
   @override
   ConsumerState<SlideshowScreen> createState() => _SlideshowScreenState();
 }
 
 class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
+  static const bool _showHud = false;
   int i = 0;
   bool playing = true;
   Timer? t;
@@ -60,37 +68,79 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   final Set<String> _hdUpgradeInFlightUrls = <String>{};
   int _prefetchReadyCount = 0;
   int _prefetchTargetCount = 0;
+  final List<ApodEntry> _timeline = <ApodEntry>[];
+  final Set<String> _timelineDates = <String>{};
+  DateTime? _prefetchCursorDate;
+  bool _prefetchInProgress = false;
+  bool _timelineAdvanceInProgress = false;
+  int _cacheCurrentBytes = 0;
+  int _appCacheBytes = 0;
+  int _cacheMaxBytes = 0;
+  bool _cacheTrimInProgress = false;
+  DateTime? _cacheLastTrimAt;
+  int _cacheLastTrimRemovedBytes = 0;
+  int _cacheLastTrimRemovedCount = 0;
+  VoidCallback? _cacheDebugListener;
+  CacheService? _cacheService;
 
   static const _controlsHideDelay = Duration(seconds: 4);
   static const _pointerWakeDebounce = Duration(milliseconds: 250);
+  static const _fixedWorkingSetWindow = 5;
+  static final DateTime _firstApodDate = NasaApiService.firstApodDate;
 
-  List<ApodEntry> _playableItems([List<ApodEntry>? source]) {
-    final items =
-        source ?? ref.read(slideshowEntriesProvider) ?? const <ApodEntry>[];
-    return items
-        .where((entry) => !entry.shouldRenderAsVideo)
-        .toList(growable: false);
+  String? _imageUrlForEntry(ApodEntry entry, {bool? lowInternetUsage}) =>
+      entry.imageUrlFor(
+        lowInternetUsage:
+            lowInternetUsage ?? ref.read(lowInternetUsageModeProvider),
+      );
+
+  String? _fastImageUrlForEntry(ApodEntry entry, {bool? lowInternetUsage}) {
+    final lowInternet =
+        lowInternetUsage ?? (ref.read(lowInternetUsageModeProvider) == true);
+    return lowInternet ? entry.standardImageUrl : entry.slideshowImageUrl;
   }
+
+  int get _directionStep =>
+      widget.direction == SlideshowDirection.forward ? 1 : -1;
 
   @override
   void initState() {
     super.initState();
     _startedAt = DateTime.now();
+    _timeline.add(widget.initialEntry);
+    _timelineDates.add(_dateKey(widget.initialEntry.date));
+    _prefetchCursorDate = _shiftDate(widget.initialEntry.date, _directionStep);
+    _attachCacheDebugListener();
     unawaited(WakelockPlus.enable());
     _showControlsTemporarily();
     unawaited(_bootstrapSlideshow());
   }
 
-  Future<void> _bootstrapSlideshow() async {
-    final items = _playableItems();
-    if (items.isEmpty) {
-      if (mounted) {
-        setState(() => _initialVisualReady = true);
-      }
-      return;
+  void _attachCacheDebugListener() {
+    final cacheService = ref.read(cacheServiceProvider);
+    _cacheService = cacheService;
+    void syncFromSnapshot() {
+      final snapshot = cacheService.debugSnapshot.value;
+      if (!mounted) return;
+      setState(() {
+        _cacheCurrentBytes = snapshot.currentBytes;
+        _appCacheBytes = snapshot.appCacheBytes;
+        _cacheMaxBytes = snapshot.maxBytes;
+        _cacheTrimInProgress = snapshot.isTrimming;
+        _cacheLastTrimAt = snapshot.lastTrimAt;
+        _cacheLastTrimRemovedBytes = snapshot.lastTrimRemovedBytes;
+        _cacheLastTrimRemovedCount = snapshot.lastTrimRemovedCount;
+      });
     }
 
-    await _prepareInitialVisual(items.first);
+    _cacheDebugListener = syncFromSnapshot;
+    cacheService.debugSnapshot.addListener(syncFromSnapshot);
+    syncFromSnapshot();
+    unawaited(cacheService.refreshDebugCacheSize());
+  }
+
+  Future<void> _bootstrapSlideshow() async {
+    await _prepareInitialVisual(_timeline.first);
     if (!mounted) return;
 
     setState(() {
@@ -99,16 +149,22 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     });
     _activateSlideForIndex(0);
     _tick();
-    final first = items.first;
-    final firstFast = first.slideshowImageUrl;
-    final firstHd = first.hdurl;
-    if (firstFast != null &&
+    final first = _timeline.first;
+    final lowInternetUsage = ref.read(lowInternetUsageModeProvider);
+    final firstFast = _fastImageUrlForEntry(
+      first,
+      lowInternetUsage: lowInternetUsage,
+    );
+    final firstHd = lowInternetUsage ? null : first.hdurl;
+    if (!lowInternetUsage &&
+        firstFast != null &&
         firstHd != null &&
         firstHd.trim().isNotEmpty &&
         firstHd != firstFast) {
       unawaited(_primeHdUpgrade(first));
     }
-    unawaited(_syncSlidingCacheForIndex(0, reason: 'bootstrap'));
+    unawaited(_prefetchAhead(reason: 'bootstrap'));
+    unawaited(_syncDirectionalCache(reason: 'bootstrap'));
   }
 
   Future<void> _prepareInitialVisual(ApodEntry entry) async {
@@ -121,27 +177,28 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     unawaited(cache.downloadFile(previewUrl));
   }
 
-  Future<void> _syncSlidingCacheForIndex(
-    int index, {
-    required String reason,
-  }) async {
-    final items = _playableItems();
-    if (items.isEmpty) return;
-    final window = ref.read(precacheWindowProvider).clamp(5, 15);
-    final start = max(0, index - window);
-    final end = min(items.length - 1, index + window);
+  Future<void> _syncDirectionalCache({required String reason}) async {
+    if (_timeline.isEmpty) return;
+    final window = _fixedWorkingSetWindow;
+    final start = i.clamp(0, _timeline.length - 1);
+    final end = min(_timeline.length - 1, start + window);
     final urls = <String>{};
     final hdCandidates = <ApodEntry>[];
+    final lowInternetUsage = ref.read(lowInternetUsageModeProvider);
     for (var idx = start; idx <= end; idx++) {
-      final entry = items[idx];
+      final entry = _timeline[idx];
       final preview = _previewUrlForCaching(entry);
       if (preview != null && preview.trim().isNotEmpty) {
         urls.add(preview);
       }
-      if (entry.shouldRenderAsImage) {
-        final fast = entry.slideshowImageUrl;
+      if (!lowInternetUsage && entry.shouldRenderAsImage) {
+        final fast = _fastImageUrlForEntry(
+          entry,
+          lowInternetUsage: lowInternetUsage,
+        );
         final hd = entry.hdurl;
         if (fast != null && hd != null && hd.trim().isNotEmpty && hd != fast) {
+          urls.add(hd);
           hdCandidates.add(entry);
         }
       }
@@ -151,7 +208,11 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     }
     await ref
         .read(cacheServiceProvider)
-        .syncSlideshowWindowUrls(urls, reason: '$reason:idx=$index');
+        .syncSlideshowWindowUrls(
+          urls,
+          reason: '$reason:idx=$i',
+          pinnedUrls: urls,
+        );
     if (!mounted) return;
     await _refreshPrefetchStatus(urls);
   }
@@ -173,7 +234,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
       // Video slides are allowed to complete naturally before advancing.
       if (_awaitingVideoCompletion) return;
 
-      _advanceToNext();
+      unawaited(_advanceToNext(stopWhenUnavailable: true));
     });
   }
 
@@ -195,36 +256,54 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     _showControlsTemporarily();
   }
 
-  void _advanceToNext() {
-    final items = _playableItems();
-    if (items.isEmpty) return;
-    final next = ((i + 1) % items.length).toInt();
-    _goToIndex(next);
+  Future<void> _advanceToNext({required bool stopWhenUnavailable}) async {
+    if (_timelineAdvanceInProgress) return;
+    _timelineAdvanceInProgress = true;
+    try {
+      if (i + 1 >= _timeline.length) {
+        await _prefetchAhead(minUpcoming: 1, reason: 'advance');
+      }
+      if (!mounted) return;
+      if (i + 1 < _timeline.length) {
+        _goToIndex(i + 1);
+        return;
+      }
+      if (stopWhenUnavailable) {
+        setState(() => playing = false);
+        t?.cancel();
+      }
+    } finally {
+      _timelineAdvanceInProgress = false;
+    }
   }
 
   void _goToIndex(int index) {
-    final items = _playableItems();
-    if (items.isEmpty) return;
-    final safe = index.clamp(0, items.length - 1);
+    if (_timeline.isEmpty) return;
+    final safe = index.clamp(0, _timeline.length - 1);
     setState(() => i = safe);
     _activateSlideForIndex(safe);
-    final entry = items[safe];
-    final fast = entry.slideshowImageUrl;
-    final hd = entry.hdurl;
-    if (fast != null &&
+    final entry = _timeline[safe];
+    final lowInternetUsage = ref.read(lowInternetUsageModeProvider);
+    final fast = _fastImageUrlForEntry(
+      entry,
+      lowInternetUsage: lowInternetUsage,
+    );
+    final hd = lowInternetUsage ? null : entry.hdurl;
+    if (!lowInternetUsage &&
+        fast != null &&
         hd != null &&
         hd.trim().isNotEmpty &&
         hd != fast &&
         !_hdUpgradeReadyUrls.contains(hd)) {
       unawaited(_primeHdUpgrade(entry));
     }
-    unawaited(_syncSlidingCacheForIndex(safe, reason: 'step'));
+    unawaited(_prefetchAhead(reason: 'step'));
+    unawaited(_syncDirectionalCache(reason: 'step'));
   }
 
   void _activateSlideForIndex(int index) {
-    final items = _playableItems();
-    if (items.isEmpty) return;
-    final entry = items[index];
+    if (_timeline.isEmpty) return;
+    final entry = _timeline[index];
     final key =
         '${entry.date.toIso8601String()}|${entry.mediaType}|${entry.url}|${entry.thumbnailUrl}';
     if (_activeSlideKey == key) return;
@@ -238,6 +317,91 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     }
 
     _startVideoSlidePlayback(entry);
+  }
+
+  bool _isWithinDateBounds(DateTime date) =>
+      !date.isBefore(_firstApodDate) &&
+      !date.isAfter(widget.latestAvailableDate);
+
+  DateTime _shiftDate(DateTime date, int days) {
+    final base = DateTime(date.year, date.month, date.day);
+    return base.add(Duration(days: days));
+  }
+
+  String _dateKey(DateTime date) =>
+      '${date.year.toString().padLeft(4, '0')}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
+
+  bool _isUsableTimelineEntry(ApodEntry entry) {
+    if (!_isWithinDateBounds(entry.date)) return false;
+    if (entry.shouldRenderAsVideo) return false;
+    if (entry.shouldRenderAsImage) {
+      final url = _imageUrlForEntry(entry);
+      return url != null && url.trim().isNotEmpty;
+    }
+    return true;
+  }
+
+  Future<void> _prefetchAhead({
+    required String reason,
+    int? minUpcoming,
+  }) async {
+    if (_prefetchInProgress || _prefetchCursorDate == null) return;
+    final apiKey = ref.read(apiKeyProvider);
+    if (apiKey == null || apiKey.trim().isEmpty) return;
+
+    final targetUpcoming = minUpcoming ?? _fixedWorkingSetWindow;
+    if ((_timeline.length - i - 1) >= targetUpcoming) return;
+
+    final lowInternetUsage = ref.read(lowInternetUsageModeProvider);
+    final api = ref.read(nasaApiServiceProvider);
+    _prefetchInProgress = true;
+    try {
+      while (mounted && (_timeline.length - i - 1) < targetUpcoming) {
+        final candidateDate = _prefetchCursorDate;
+        if (candidateDate == null || !_isWithinDateBounds(candidateDate)) {
+          break;
+        }
+
+        try {
+          final entry = await api.fetchByDate(apiKey, candidateDate);
+          _prefetchCursorDate = _shiftDate(candidateDate, _directionStep);
+          if (!_isUsableTimelineEntry(entry)) {
+            continue;
+          }
+          final key = _dateKey(entry.date);
+          if (_timelineDates.contains(key)) {
+            continue;
+          }
+          _timeline.add(entry);
+          _timelineDates.add(key);
+          unawaited(
+            ref
+                .read(cacheServiceProvider)
+                .warmEntry(
+                  entry,
+                  reason: '$reason:prefetch',
+                  lowInternetUsage: lowInternetUsage,
+                ),
+          );
+        } on NasaApiException catch (e) {
+          if (e.shouldAbortDateSearch) {
+            break;
+          }
+          // Missing/unavailable APOD dates are skipped as part of directional traversal.
+          _prefetchCursorDate = _shiftDate(candidateDate, _directionStep);
+        } catch (_) {
+          // Keep current cursor and retry later on transient failures.
+          break;
+        }
+      }
+    } finally {
+      try {
+        await _syncDirectionalCache(reason: reason);
+      } finally {
+        _prefetchInProgress = false;
+        if (mounted) setState(() {});
+      }
+    }
   }
 
   Future<void> _startVideoSlidePlayback(ApodEntry entry) async {
@@ -266,7 +430,9 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
         if (!mounted) return;
         if (value.playerState == PlayerState.ended) {
           _awaitingVideoCompletion = false;
-          if (playing) _advanceToNext();
+          if (playing) {
+            unawaited(_advanceToNext(stopWhenUnavailable: true));
+          }
         }
       });
 
@@ -294,7 +460,9 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
       final value = controller.value;
       if (value.isCompleted) {
         _awaitingVideoCompletion = false;
-        if (playing) _advanceToNext();
+        if (playing) {
+          unawaited(_advanceToNext(stopWhenUnavailable: true));
+        }
       }
     };
     controller.addListener(_videoListener!);
@@ -349,6 +517,12 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   void dispose() {
     t?.cancel();
     _controlsTimer?.cancel();
+    final cacheListener = _cacheDebugListener;
+    if (cacheListener != null) {
+      _cacheService?.debugSnapshot.removeListener(cacheListener);
+    }
+    _cacheDebugListener = null;
+    _cacheService = null;
     unawaited(WakelockPlus.disable());
     unawaited(_disposeSlideMedia());
     super.dispose();
@@ -356,16 +530,12 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final items = _playableItems(ref.watch(slideshowEntriesProvider));
-    final elapsed = DateTime.now().difference(_startedAt);
-    final remaining = widget.runDuration - elapsed;
-    final remainingText = remaining.isNegative
-        ? '00:00'
-        : '${remaining.inMinutes.remainder(60).toString().padLeft(2, '0')}:${remaining.inSeconds.remainder(60).toString().padLeft(2, '0')}';
+    final items = _timeline;
+    final lowInternetUsage = ref.watch(lowInternetUsageModeProvider);
 
     if (items.isEmpty) {
       return const CosmicScaffold(
-        child: Center(child: Text('No slideshow items (videos are skipped)')),
+        child: Center(child: Text('No slideshow items are available.')),
       );
     }
 
@@ -403,14 +573,64 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
                   child: _buildSlideContent(e),
                 ),
               ),
-              if (_prefetchTargetCount > 0)
+              if (_showHud)
                 Positioned(
                   top: 14,
                   right: 14,
-                  child: SpaceProgressBadge(
-                    current: _prefetchReadyCount,
-                    total: _prefetchTargetCount,
-                    label: 'Prefetched',
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 8,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withValues(alpha: 0.44),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(
+                        color: AppTheme.accent.withValues(alpha: 0.2),
+                      ),
+                    ),
+                    child: DefaultTextStyle(
+                      style: Theme.of(
+                        context,
+                      ).textTheme.bodySmall!.copyWith(color: Colors.white70),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            'Cache ${_formatBytes(_cacheCurrentBytes)} / ${_formatBytes(_cacheMaxBytes)}',
+                            style: const TextStyle(fontWeight: FontWeight.w700),
+                          ),
+                          Text(
+                            'App cache: ${_formatBytes(_appCacheBytes)}',
+                            style: const TextStyle(color: Colors.white60),
+                          ),
+                          if (_prefetchTargetCount > 0)
+                            Text(
+                              'Window prefetched: $_prefetchReadyCount/$_prefetchTargetCount',
+                              style: const TextStyle(color: Colors.white60),
+                            ),
+                          Text(
+                            _cacheTrimInProgress
+                                ? 'Cleaning cache...'
+                                : 'Clean idle',
+                            style: TextStyle(
+                              color: _cacheTrimInProgress
+                                  ? AppTheme.accentSoft
+                                  : Colors.white60,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          if (!_cacheTrimInProgress &&
+                              _cacheLastTrimRemovedCount > 0 &&
+                              _cacheLastTrimAt != null)
+                            Text(
+                              'Last clean: -${_formatBytes(_cacheLastTrimRemovedBytes)} (${_cacheLastTrimRemovedCount})',
+                              style: const TextStyle(color: Colors.white60),
+                            ),
+                        ],
+                      ),
+                    ),
                   ),
                 ),
               Positioned(
@@ -483,11 +703,8 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
                       ),
                       IconButton(
                         onPressed: () {
-                          final items = _playableItems();
-                          if (items.isEmpty) return;
-                          _goToIndex(
-                            ((i - 1 + items.length) % items.length).toInt(),
-                          );
+                          if (i <= 0) return;
+                          _goToIndex(i - 1);
                           _showControlsTemporarily();
                         },
                         icon: const Icon(Icons.skip_previous),
@@ -509,12 +726,17 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
                       ),
                       IconButton(
                         onPressed: () {
-                          _advanceToNext();
+                          unawaited(_advanceToNext(stopWhenUnavailable: false));
                           _showControlsTemporarily();
                         },
                         icon: const Icon(Icons.skip_next),
                       ),
-                      if (e.shouldRenderAsImage && e.bestImageUrl != null)
+                      if (e.shouldRenderAsImage &&
+                          _imageUrlForEntry(
+                                e,
+                                lowInternetUsage: lowInternetUsage,
+                              ) !=
+                              null)
                         IconButton(
                           tooltip: 'Set wallpaper',
                           onPressed: () async {
@@ -523,15 +745,6 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
                           },
                           icon: const Icon(Icons.wallpaper),
                         ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          '${widget.direction == SlideshowDirection.forward ? 'Forward' : 'Backward'} · $remainingText',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(fontWeight: FontWeight.w600),
-                        ),
-                      ),
                     ],
                   ),
                 ),
@@ -551,7 +764,9 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   }
 
   Widget _buildImageSlide(ApodEntry entry) {
-    final hdFallbackUrl = entry.bestImageUrl;
+    final lowInternetUsage = ref.read(lowInternetUsageModeProvider);
+    final cacheManager = ref.read(cacheServiceProvider).imageCache;
+    final hdFallbackUrl = lowInternetUsage ? null : entry.bestImageUrl;
     final imageUrl = _effectiveSlideImageUrl(entry);
     if (imageUrl == null || imageUrl.trim().isEmpty) {
       _skipCurrentIfPossible(entry, reason: 'missing-image-url');
@@ -561,6 +776,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     return CachedNetworkImage(
       key: ValueKey('img_${entry.date.toIso8601String()}_$imageUrl'),
       imageUrl: imageUrl,
+      cacheManager: cacheManager,
       fit: BoxFit.cover,
       placeholder: (_, _) => _spaceLoadingScreen(message: 'Loading image...'),
       errorWidget: (_, _, _) {
@@ -569,6 +785,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
             hdFallbackUrl != imageUrl) {
           return CachedNetworkImage(
             imageUrl: hdFallbackUrl,
+            cacheManager: cacheManager,
             fit: BoxFit.cover,
             placeholder: (_, _) =>
                 _spaceLoadingScreen(message: 'Loading fallback...'),
@@ -589,8 +806,15 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   }
 
   String? _effectiveSlideImageUrl(ApodEntry entry) {
-    final fast = entry.slideshowImageUrl;
-    if (fast == null || fast.trim().isEmpty) return entry.bestImageUrl;
+    final lowInternetUsage = ref.read(lowInternetUsageModeProvider);
+    final fast = _fastImageUrlForEntry(
+      entry,
+      lowInternetUsage: lowInternetUsage,
+    );
+    if (lowInternetUsage) return fast;
+    if (fast == null || fast.trim().isEmpty) {
+      return entry.imageUrlFor(lowInternetUsage: false);
+    }
     final hd = entry.hdurl;
     if (hd != null &&
         hd.trim().isNotEmpty &&
@@ -607,11 +831,10 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     _failedImageSlides.add(key);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      final items = _playableItems();
-      if (items.length <= 1) return;
-      if (i < 0 || i >= items.length) return;
-      if (items[i].date != entry.date) return;
-      _advanceToNext();
+      if (_timeline.length <= 1) return;
+      if (i < 0 || i >= _timeline.length) return;
+      if (_timeline[i].date != entry.date) return;
+      unawaited(_advanceToNext(stopWhenUnavailable: true));
     });
   }
 
@@ -685,6 +908,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     required IconData icon,
   }) {
     unawaited(_ensureDynamicPreviewResolved(entry));
+    final cacheManager = ref.read(cacheServiceProvider).imageCache;
     final previewUrl = _previewUrlForCaching(entry);
     return Container(
       key: ValueKey('${keyPrefix}_${entry.date.toIso8601String()}'),
@@ -700,6 +924,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
                   borderRadius: BorderRadius.circular(16),
                   child: CachedNetworkImage(
                     imageUrl: previewUrl,
+                    cacheManager: cacheManager,
                     height: 220,
                     fit: BoxFit.cover,
                     placeholder: (_, _) => const SpaceImagePlaceholder(
@@ -737,8 +962,9 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   }
 
   String? _previewUrlForCaching(ApodEntry entry) {
-    if (entry.shouldRenderAsImage && entry.slideshowImageUrl != null) {
-      return entry.slideshowImageUrl;
+    final fastImage = _fastImageUrlForEntry(entry);
+    if (entry.shouldRenderAsImage && fastImage != null) {
+      return fastImage;
     }
     if (entry.thumbnailUrl != null && entry.thumbnailUrl!.trim().isNotEmpty) {
       return entry.thumbnailUrl;
@@ -757,8 +983,9 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   }
 
   Future<void> _primeHdUpgrade(ApodEntry entry) async {
+    if (ref.read(lowInternetUsageModeProvider)) return;
     final hd = entry.hdurl;
-    final fast = entry.slideshowImageUrl;
+    final fast = _fastImageUrlForEntry(entry, lowInternetUsage: false);
     if (hd == null || hd.trim().isEmpty || hd == fast) return;
     if (_hdUpgradeReadyUrls.contains(hd) ||
         _hdUpgradeInFlightUrls.contains(hd)) {
@@ -856,7 +1083,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     if (!mounted) return;
     setState(() {});
     if (discovered != null && discovered.trim().isNotEmpty) {
-      unawaited(_syncSlidingCacheForIndex(i, reason: 'preview_resolved'));
+      unawaited(_syncDirectionalCache(reason: 'preview_resolved'));
     }
   }
 
@@ -893,6 +1120,22 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     return null;
   }
 
+  String _formatBytes(int bytes) {
+    final safe = max(0, bytes);
+    if (safe == 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    var value = safe.toDouble();
+    var unitIndex = 0;
+    while (value >= 1024 && unitIndex < units.length - 1) {
+      value /= 1024;
+      unitIndex++;
+    }
+    final display = unitIndex == 0
+        ? value.toStringAsFixed(0)
+        : value.toStringAsFixed(1);
+    return '$display ${units[unitIndex]}';
+  }
+
   Widget _spaceLoadingScreen({required String message}) {
     return SpaceLoadingSurface(
       message: message,
@@ -904,52 +1147,77 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     BuildContext context,
     ApodEntry entry,
   ) async {
-    final imageUrl = entry.bestImageUrl;
+    final imageUrl = _imageUrlForEntry(entry);
     if (imageUrl == null) return;
 
-    var style = WallpaperFit.fill;
-    if (Platform.isWindows) {
-      final picked = await _pickWindowsWallpaperStyle(context);
-      if (picked == null) return;
-      style = picked;
+    final wallpaperService = ref.read(wallpaperServiceProvider);
+    final wasPlaying = playing;
+    if (wasPlaying) {
+      setState(() => playing = false);
+      t?.cancel();
+      await _syncCurrentMediaPlayback();
     }
 
-    final file = await ref
-        .read(cacheServiceProvider)
-        .imageCache
-        .getSingleFile(imageUrl);
-    final msg = await ref
-        .read(wallpaperServiceProvider)
-        .setImageWallpaper(file.path, style: style);
-    if (!context.mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
-  }
-
-  Future<WallpaperFit?> _pickWindowsWallpaperStyle(BuildContext context) {
-    return showModalBottomSheet<WallpaperFit>(
-      context: context,
-      builder: (context) {
-        return SafeArea(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const ListTile(title: Text('Wallpaper Style')),
-              ListTile(
-                title: const Text('Fill'),
-                onTap: () => Navigator.pop(context, WallpaperFit.fill),
+    try {
+      final file = await ref
+          .read(cacheServiceProvider)
+          .imageCache
+          .getSingleFile(imageUrl);
+      if (!context.mounted) return;
+      if (Platform.isAndroid) {
+        final confirm = await showDialog<bool>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+            title: const Text('Set wallpaper?'),
+            content: const Text(
+              'Open Android wallpaper settings for this image?',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dialogContext, false),
+                child: const Text('Cancel'),
               ),
-              ListTile(
-                title: const Text('Stretch'),
-                onTap: () => Navigator.pop(context, WallpaperFit.stretch),
-              ),
-              ListTile(
-                title: const Text('Fit'),
-                onTap: () => Navigator.pop(context, WallpaperFit.fit),
+              FilledButton(
+                onPressed: () => Navigator.pop(dialogContext, true),
+                child: const Text('Continue'),
               ),
             ],
           ),
         );
-      },
-    );
+        if (!context.mounted || confirm != true) return;
+        final msg = await wallpaperService.openAndroidSystemWallpaperPicker(
+          file.path,
+        );
+        if (!context.mounted) return;
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(msg)));
+        return;
+      }
+      final platformTargetSize = await wallpaperService
+          .getPlatformWallpaperTargetSize();
+      if (!context.mounted) return;
+      final setup = await showWallpaperSetupOverlay(
+        context,
+        sourcePath: file.path,
+        title: entry.title,
+        platformTargetSize: platformTargetSize,
+      );
+      if (!context.mounted || setup == null || !setup.applied) return;
+      final outputPath = setup.outputPath ?? file.path;
+
+      final msg = await wallpaperService.setImageWallpaper(
+        outputPath,
+        style: setup.style,
+      );
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+    } finally {
+      if (wasPlaying && mounted) {
+        setState(() => playing = true);
+        _tick();
+        await _syncCurrentMediaPlayback();
+      }
+    }
   }
 }

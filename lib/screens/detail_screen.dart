@@ -1,20 +1,22 @@
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:photo_view/photo_view.dart';
-import 'package:url_launcher/url_launcher.dart';
 
 import '../models/apod_entry.dart';
-import '../ui/app_theme.dart';
+import '../providers/app_providers.dart';
 import '../ui/cosmic_scaffold.dart';
+import '../widgets/apod_inline_media.dart';
 
 /// Full-detail APOD page with zoomable media and metadata panel.
-class DetailScreen extends StatelessWidget {
+class DetailScreen extends ConsumerWidget {
   const DetailScreen({super.key, required this.entry});
 
   final ApodEntry entry;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    final lowInternetUsage = ref.watch(lowInternetUsageModeProvider);
     return CosmicScaffold(
       padding: EdgeInsets.zero,
       appBar: AppBar(
@@ -22,14 +24,23 @@ class DetailScreen extends StatelessWidget {
       ),
       child: Center(
         child: entry.shouldRenderAsImage
-            ? _imageContent(context)
-            : _videoFallback(context),
+            ? _imageContent(context, lowInternetUsage: lowInternetUsage)
+            : ApodInlineMedia(
+                key: ValueKey(
+                  'detail_inline_media_${entry.date.toIso8601String()}',
+                ),
+                entry: entry,
+                autoplayMuted: true,
+                showPlaybackControls: true,
+                interactive: true,
+                fit: BoxFit.contain,
+              ),
       ),
     );
   }
 
-  Widget _imageContent(BuildContext context) {
-    final imageUrl = entry.bestImageUrl;
+  Widget _imageContent(BuildContext context, {required bool lowInternetUsage}) {
+    final imageUrl = entry.imageUrlFor(lowInternetUsage: lowInternetUsage);
     if (imageUrl == null) {
       return Container(
         color: const Color(0xFF101A2E),
@@ -47,35 +58,6 @@ class DetailScreen extends StatelessWidget {
       maxScale: PhotoViewComputedScale.contained * 4,
       imageProvider: CachedNetworkImageProvider(imageUrl),
       backgroundDecoration: const BoxDecoration(color: Colors.transparent),
-    );
-  }
-
-  Widget _videoFallback(BuildContext context) {
-    // External player flow keeps video integration lightweight and robust.
-    final launch = entry.launchUrl;
-    return Container(
-      color: const Color(0xFF101A2E),
-      child: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(
-              Icons.ondemand_video,
-              size: 46,
-              color: AppTheme.accentSoft,
-            ),
-            const SizedBox(height: 10),
-            ElevatedButton(
-              onPressed: launch == null
-                  ? null
-                  : () => launchUrl(Uri.parse(launch)),
-              child: Text(
-                entry.shouldRenderAsAudio ? 'Open Audio' : 'Open Media',
-              ),
-            ),
-          ],
-        ),
-      ),
     );
   }
 }
