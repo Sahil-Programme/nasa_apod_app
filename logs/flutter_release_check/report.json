@@ -1,0 +1,71 @@
+{
+  "project_root": "D:\\dev\\projects\\nasa_apod_app",
+  "flutter_bin": "C:\\dev\\flutter\\bin\\flutter.BAT",
+  "generated_at_epoch_seconds": 1778031767,
+  "overall_ok": false,
+  "steps": [
+    {
+      "name": "Flutter Version",
+      "command": [
+        "C:\\dev\\flutter\\bin\\flutter.BAT",
+        "--version"
+      ],
+      "exit_code": 124,
+      "duration_seconds": 1200.03,
+      "stdout_log": "D:\\dev\\projects\\nasa_apod_app\\logs\\flutter_release_check\\flutter_version.stdout.log",
+      "stderr_log": "D:\\dev\\projects\\nasa_apod_app\\logs\\flutter_release_check\\flutter_version.stderr.log",
+      "ok": false
+    },
+    {
+      "name": "Pub Get",
+      "command": [
+        "C:\\dev\\flutter\\bin\\flutter.BAT",
+        "pub",
+        "get"
+      ],
+      "exit_code": 124,
+      "duration_seconds": 1200.02,
+      "stdout_log": "D:\\dev\\projects\\nasa_apod_app\\logs\\flutter_release_check\\pub_get.stdout.log",
+      "stderr_log": "D:\\dev\\projects\\nasa_apod_app\\logs\\flutter_release_check\\pub_get.stderr.log",
+      "ok": false
+    },
+    {
+      "name": "Analyze",
+      "command": [
+        "C:\\dev\\flutter\\bin\\flutter.BAT",
+        "analyze"
+      ],
+      "exit_code": 124,
+      "duration_seconds": 1200.03,
+      "stdout_log": "D:\\dev\\projects\\nasa_apod_app\\logs\\flutter_release_check\\analyze.stdout.log",
+      "stderr_log": "D:\\dev\\projects\\nasa_apod_app\\logs\\flutter_release_check\\analyze.stderr.log",
+      "ok": false
+    },
+    {
+      "name": "Test",
+      "command": [
+        "C:\\dev\\flutter\\bin\\flutter.BAT",
+        "test"
+      ],
+      "exit_code": 124,
+      "duration_seconds": 1200.03,
+      "stdout_log": "D:\\dev\\projects\\nasa_apod_app\\logs\\flutter_release_check\\test.stdout.log",
+      "stderr_log": "D:\\dev\\projects\\nasa_apod_app\\logs\\flutter_release_check\\test.stderr.log",
+      "ok": false
+    },
+    {
+      "name": "Build AppBundle",
+      "command": [
+        "C:\\dev\\flutter\\bin\\flutter.BAT",
+        "build",
+        "appbundle",
+        "--release"
+      ],
+      "exit_code": 124,
+      "duration_seconds": 1200.03,
+      "stdout_log": "D:\\dev\\projects\\nasa_apod_app\\logs\\flutter_release_check\\build_appbundle.stdout.log",
+      "stderr_log": "D:\\dev\\projects\\nasa_apod_app\\logs\\flutter_release_check\\build_appbundle.stderr.log",
+      "ok": false
+    }
+  ]
+}

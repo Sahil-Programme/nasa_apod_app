@@ -25,6 +25,15 @@ class ApodEntry {
   final String? thumbnailUrl;
   final String? copyright;
 
+  /// Normalized copyright holder text from the APOD payload.
+  String? get copyrightNotice {
+    final value = copyright?.trim();
+    if (value == null || value.isEmpty) return null;
+    return value;
+  }
+
+  bool get hasCopyrightNotice => copyrightNotice != null;
+
   static const Set<String> _imageExt = {
     '.jpg',
     '.jpeg',

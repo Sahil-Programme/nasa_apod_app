@@ -18,6 +18,7 @@ import kotlin.math.roundToInt
 
 class MainActivity : FlutterActivity() {
     private val wallpaperChannel = "nasa_apod_app/wallpaper_android"
+    private val wallpaperShareDirName = "wallpaper_share"
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -263,11 +264,16 @@ class MainActivity : FlutterActivity() {
         val path = args["path"] as? String ?: return false
         val file = File(path)
         if (!file.exists() || !file.isFile) return false
+        val sharedFile = try {
+            prepareWallpaperShareFile(file)
+        } catch (_: Exception) {
+            return false
+        }
 
         val contentUri: Uri = FileProvider.getUriForFile(
             this,
             "${applicationContext.packageName}.fileprovider",
-            file,
+            sharedFile,
         )
 
         val intent = try {
@@ -286,5 +292,25 @@ class MainActivity : FlutterActivity() {
         if (intent.resolveActivity(resolver) == null) return false
         startActivity(Intent.createChooser(intent, "Set wallpaper"))
         return true
+    }
+
+    private fun prepareWallpaperShareFile(sourceFile: File): File {
+        val shareDir = File(cacheDir, wallpaperShareDirName)
+        if (!shareDir.exists()) {
+            shareDir.mkdirs()
+        }
+
+        val sourceExt = sourceFile.extension.trim()
+        val extension = if (sourceExt.isBlank()) "png" else sourceExt
+        val sourceBase = sourceFile.nameWithoutExtension.trim()
+        val safeBase = if (sourceBase.isBlank()) "wallpaper" else {
+            sourceBase.replace(Regex("[^A-Za-z0-9._-]"), "_")
+        }
+        val sharedFile = File(
+            shareDir,
+            "${safeBase}_${System.currentTimeMillis()}.$extension",
+        )
+        sourceFile.copyTo(sharedFile, overwrite = true)
+        return sharedFile
     }
 }

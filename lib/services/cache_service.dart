@@ -206,41 +206,11 @@ class CacheService {
     _managedSlideshowUrls.clear();
     appBytes = await _readAppCacheBytes();
     _publishDebug(currentBytes: 0, appCacheBytes: appBytes);
-    if (appBytes <= _maxCacheBytes) return;
-
-    // Then trim oldest files from app temp cache dir to enforce hard cap in debug mode.
-    final cacheDir = await getTemporaryDirectory();
-    if (!await cacheDir.exists()) return;
-    final files = <({File file, int bytes, DateTime modified})>[];
-    await for (final entity in cacheDir.list(
-      recursive: true,
-      followLinks: false,
-    )) {
-      if (entity is! File) continue;
-      try {
-        final bytes = await entity.length();
-        final stat = await entity.stat();
-        files.add((
-          file: entity,
-          bytes: max(0, bytes),
-          modified: stat.modified,
-        ));
-      } catch (_) {
-        // Ignore files that disappear while scanning.
-      }
+    if (appBytes > _maxCacheBytes) {
+      _log(
+        'APP_CACHE_OVER_BUDGET bytes=$appBytes max=$_maxCacheBytes (skipped non-managed temp-file deletion)',
+      );
     }
-    files.sort((a, b) => a.modified.compareTo(b.modified));
-    var running = appBytes;
-    for (final item in files) {
-      if (running <= _trimTargetBytes) break;
-      try {
-        await item.file.delete();
-        running -= item.bytes;
-      } catch (_) {
-        // Ignore file delete failures.
-      }
-    }
-    _publishDebug(appCacheBytes: max(0, running));
   }
 
   /// Ensures current media (or video thumbnail) is cached and logs status in debug.
@@ -329,10 +299,10 @@ class CacheService {
       'SYNC reason=$reason keep=${desired.length} add=${add.length} purge=${purge.length}',
     );
 
-    await Future.wait(
-      add.map((url) => _cacheUrl(url, reason: '$reason:add')),
-      eagerError: false,
-    );
+    // Sequential caching avoids burst parallel downloads that can jank slideshow playback.
+    for (final url in add) {
+      await _cacheUrl(url, reason: '$reason:add');
+    }
     for (final url in purge) {
       await _purgeUrl(url, reason: '$reason:purge');
     }

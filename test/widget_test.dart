@@ -18,6 +18,11 @@ import 'package:nasa_apod_app/services/cache_service.dart';
 import 'package:nasa_apod_app/services/nasa_api_service.dart';
 import 'package:nasa_apod_app/services/wallpaper_service.dart';
 
+DateTime _dayOnly(DateTime date) => DateTime(date.year, date.month, date.day);
+
+String _dayKey(DateTime date) =>
+    _dayOnly(date).toIso8601String().split('T').first;
+
 class _RecordingCacheService extends CacheService {
   Set<String>? lastDesiredUrls;
   final List<ApodEntry> warmed = <ApodEntry>[];
@@ -81,14 +86,21 @@ class _FakeNasaApiService extends NasaApiService {
     this.today,
     this.todayFuture,
     Map<String, ApodEntry>? byDate,
-    this.rangeFailuresRemaining = 0,
-  }) : assert(today != null || todayFuture != null),
-       byDate = byDate ?? <String, ApodEntry>{};
+    Map<String, Future<ApodEntry>>? byDateFutures,
+  }) : assert(
+         today != null ||
+             todayFuture != null ||
+             (byDate?.isNotEmpty ?? false) ||
+             (byDateFutures?.isNotEmpty ?? false),
+       ),
+       byDate = byDate ?? <String, ApodEntry>{},
+       byDateFutures = byDateFutures ?? <String, Future<ApodEntry>>{};
 
   final ApodEntry? today;
   final Future<ApodEntry>? todayFuture;
   final Map<String, ApodEntry> byDate;
-  int rangeFailuresRemaining;
+  final Map<String, Future<ApodEntry>> byDateFutures;
+  int rangeFailuresRemaining = 0;
   int todayCallCount = 0;
   int byDateCallCount = 0;
   int rangeCallCount = 0;
@@ -106,9 +118,13 @@ class _FakeNasaApiService extends NasaApiService {
   Future<ApodEntry> fetchByDate(String key, DateTime date) async {
     byDateCallCount++;
     final id = date.toIso8601String().split('T').first;
+    final pending = byDateFutures[id];
+    if (pending != null) {
+      return pending;
+    }
     final found = byDate[id];
     if (found == null) {
-      throw NasaApiException('missing $id');
+      throw NasaApiException('No data for date $id');
     }
     return found;
   }
@@ -357,8 +373,13 @@ void main() {
     tester,
   ) async {
     final cache = _RecordingCacheService();
+    final today = _dayOnly(DateTime.now());
     final todayCompleter = Completer<ApodEntry>();
-    final api = _FakeNasaApiService(todayFuture: todayCompleter.future);
+    final api = _FakeNasaApiService(
+      byDateFutures: <String, Future<ApodEntry>>{
+        _dayKey(today): todayCompleter.future,
+      },
+    );
 
     final container = ProviderContainer(
       overrides: [
@@ -383,11 +404,12 @@ void main() {
 
     expect(find.byKey(const ValueKey('home_workspace')), findsOneWidget);
     expect(container.read(currentEntryProvider).isLoading, isTrue);
-    expect(api.todayCallCount, 1);
+    expect(api.byDateCallCount, 1);
+    expect(api.todayCallCount, 0);
 
     todayCompleter.complete(
       ApodEntry(
-        date: DateTime(2026, 4, 30),
+        date: today,
         title: 'Today image',
         explanation: 'ok',
         mediaType: 'image',
@@ -409,7 +431,11 @@ void main() {
       url: 'https://example.com/current.jpg',
     );
     final todayCompleter = Completer<ApodEntry>();
-    final api = _FakeNasaApiService(todayFuture: todayCompleter.future);
+    final today = _dayOnly(DateTime.now());
+    final api = _FakeNasaApiService(
+      todayFuture: todayCompleter.future,
+      byDate: <String, ApodEntry>{_dayKey(today): current},
+    );
 
     final container = ProviderContainer(
       overrides: [
@@ -433,6 +459,10 @@ void main() {
     await tester.pump();
 
     expect(find.text('Start Slideshow'), findsOneWidget);
+    expect(api.todayCallCount, 0);
+
+    await tester.tap(find.text('Start'));
+    await tester.pump();
     expect(api.todayCallCount, 1);
 
     todayCompleter.complete(current);
@@ -572,8 +602,13 @@ void main() {
       mediaType: 'image',
       url: 'https://example.com/fresh.jpg',
     );
+    final today = _dayOnly(DateTime.now());
     final todayCompleter = Completer<ApodEntry>();
-    final api = _FakeNasaApiService(todayFuture: todayCompleter.future);
+    final api = _FakeNasaApiService(
+      byDateFutures: <String, Future<ApodEntry>>{
+        _dayKey(today): todayCompleter.future,
+      },
+    );
 
     final container = ProviderContainer(
       overrides: [
@@ -594,7 +629,7 @@ void main() {
 
     expect(cache.readLastHomeEntryCount, 1);
     expect(find.text('Cached image'), findsOneWidget);
-    expect(api.todayCallCount, 1);
+    expect(api.byDateCallCount, 1);
 
     todayCompleter.complete(fresh);
     await tester.pump();
@@ -609,14 +644,17 @@ void main() {
     tester,
   ) async {
     final cache = _RecordingCacheService();
+    final todayDate = _dayOnly(DateTime.now());
     final today = ApodEntry(
-      date: DateTime(2026, 4, 30),
+      date: todayDate,
       title: 'Today image',
       explanation: 'ok',
       mediaType: 'image',
       url: 'https://example.com/today.jpg',
     );
-    final api = _FakeNasaApiService(today: today);
+    final api = _FakeNasaApiService(
+      byDate: <String, ApodEntry>{_dayKey(todayDate): today},
+    );
 
     final container = ProviderContainer(
       overrides: [
@@ -640,7 +678,8 @@ void main() {
       container.read(currentEntryProvider).valueOrNull?.title,
       'Today image',
     );
-    expect(api.todayCallCount, 1);
+    expect(api.byDateCallCount, 1);
+    expect(api.todayCallCount, 0);
     expect(api.rangeCallCount, 0);
     expect(cache.warmed.length, 1);
     expect(cache.saveLastHomeEntryCount, 1);
@@ -648,23 +687,17 @@ void main() {
 
   testWidgets('home startup rolls back to yesterday image', (tester) async {
     final cache = _RecordingCacheService();
-    final today = ApodEntry(
-      date: DateTime(2026, 4, 30),
-      title: 'Today video',
-      explanation: 'video',
-      mediaType: 'video',
-      url: 'https://youtube.com/watch?v=abc123',
-    );
+    final todayDate = _dayOnly(DateTime.now());
+    final yesterdayDate = todayDate.subtract(const Duration(days: 1));
     final yesterday = ApodEntry(
-      date: DateTime(2026, 4, 29),
+      date: yesterdayDate,
       title: 'Yesterday image',
       explanation: 'image',
       mediaType: 'image',
       url: 'https://example.com/yesterday.jpg',
     );
     final api = _FakeNasaApiService(
-      today: today,
-      byDate: {'2026-04-29': yesterday},
+      byDate: <String, ApodEntry>{_dayKey(yesterdayDate): yesterday},
     );
 
     final container = ProviderContainer(
@@ -687,65 +720,54 @@ void main() {
 
     final loaded = container.read(currentEntryProvider).valueOrNull;
     expect(loaded?.title, 'Yesterday image');
-    expect(loaded?.date, DateTime(2026, 4, 29));
-    expect(api.todayCallCount, 1);
-    expect(api.rangeCallCount, 1);
-    expect(api.byDateCallCount, 0);
+    expect(loaded?.date, yesterdayDate);
+    expect(api.todayCallCount, 0);
+    expect(api.rangeCallCount, 0);
+    expect(api.byDateCallCount, 2);
   });
 
-  testWidgets('home startup shows explicit error when no image in 7 days', (
+  testWidgets(
+    'home startup shows explicit error when today and yesterday fail',
+    (tester) async {
+      final cache = _RecordingCacheService();
+      final api = _FakeNasaApiService(
+        byDate: <String, ApodEntry>{
+          '1995-06-16': ApodEntry(
+            date: DateTime(1995, 6, 16),
+            title: 'Seed',
+            explanation: 'seed',
+            mediaType: 'image',
+            url: 'https://example.com/seed.jpg',
+          ),
+        },
+      );
+
+      final container = ProviderContainer(
+        overrides: [
+          apiKeyProvider.overrideWith((_) => 'k'),
+          cacheServiceProvider.overrideWithValue(cache),
+          nasaApiServiceProvider.overrideWithValue(api),
+        ],
+      );
+      addTearDown(container.dispose);
+
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: const MaterialApp(home: HomeScreen()),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 120));
+
+      expect(find.textContaining('No data for date'), findsOneWidget);
+      expect(container.read(currentEntryProvider).hasError, isTrue);
+    },
+  );
+
+  testWidgets('wallpaper action is available for image entries', (
     tester,
   ) async {
-    final cache = _RecordingCacheService();
-    final today = ApodEntry(
-      date: DateTime(2026, 4, 30),
-      title: 'Today video',
-      explanation: 'video',
-      mediaType: 'video',
-      url: 'https://youtube.com/watch?v=abc123',
-    );
-    final byDate = <String, ApodEntry>{};
-    for (var d = 1; d <= 6; d++) {
-      final date = today.date.subtract(Duration(days: d));
-      final key = date.toIso8601String().split('T').first;
-      byDate[key] = ApodEntry(
-        date: date,
-        title: 'Video $d',
-        explanation: 'video',
-        mediaType: 'video',
-        url: 'https://youtube.com/watch?v=v$d',
-      );
-    }
-    final api = _FakeNasaApiService(today: today, byDate: byDate);
-
-    final container = ProviderContainer(
-      overrides: [
-        apiKeyProvider.overrideWith((_) => 'k'),
-        cacheServiceProvider.overrideWithValue(cache),
-        nasaApiServiceProvider.overrideWithValue(api),
-      ],
-    );
-    addTearDown(container.dispose);
-
-    await tester.pumpWidget(
-      UncontrolledProviderScope(
-        container: container,
-        child: const MaterialApp(home: HomeScreen()),
-      ),
-    );
-    await tester.pump();
-    await tester.pump(const Duration(milliseconds: 120));
-
-    expect(
-      find.textContaining(
-        'No displayable APOD image found in the last 7 day(s).',
-      ),
-      findsOneWidget,
-    );
-    expect(container.read(currentEntryProvider).hasError, isTrue);
-  });
-
-  testWidgets('wallpaper action asks for confirmation first', (tester) async {
     final cache = _RecordingCacheService();
     final entry = ApodEntry(
       date: DateTime(2026, 4, 30),
@@ -754,8 +776,10 @@ void main() {
       mediaType: 'image',
       url: 'https://example.com/wallpaper.jpg',
     );
-    final todayCompleter = Completer<ApodEntry>();
-    final api = _FakeNasaApiService(todayFuture: todayCompleter.future);
+    final today = _dayOnly(DateTime.now());
+    final api = _FakeNasaApiService(
+      byDate: <String, ApodEntry>{_dayKey(today): entry},
+    );
 
     final container = ProviderContainer(
       overrides: [
@@ -773,24 +797,8 @@ void main() {
         child: const MaterialApp(home: HomeScreen()),
       ),
     );
-
-    await tester.tap(find.byIcon(Icons.wallpaper_outlined).first);
     await tester.pump();
-    await tester.pump(const Duration(milliseconds: 300));
-
-    expect(find.text('Set wallpaper?'), findsOneWidget);
-    expect(
-      find.text('Use "Wallpaper image" as your wallpaper?'),
-      findsOneWidget,
-    );
-
-    await tester.tap(find.text('Cancel'));
-    await tester.pump();
-    await tester.pump(const Duration(milliseconds: 300));
-    expect(find.text('Set wallpaper?'), findsNothing);
-
-    todayCompleter.complete(entry);
-    await tester.pump();
+    expect(find.byIcon(Icons.wallpaper_outlined), findsOneWidget);
   });
 
   testWidgets('slideshow stays responsive while cache sync is pending', (

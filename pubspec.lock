@@ -935,14 +935,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.5.0"
-  wallpaper_manager_flutter:
-    dependency: "direct main"
-    description:
-      name: wallpaper_manager_flutter
-      sha256: afe9b419a91270e0bed2a76b1380bd4fe800a568494431bbf1d3308c0cdf39eb
-      url: "https://pub.dev"
-    source: hosted
-    version: "1.0.1"
   web:
     dependency: transitive
     description:
@@ -976,7 +968,7 @@ packages:
     source: hosted
     version: "4.11.0"
   webview_flutter_platform_interface:
-    dependency: transitive
+    dependency: "direct main"
     description:
       name: webview_flutter_platform_interface
       sha256: "1221c1b12f5278791042f2ec2841743784cf25c5a644e23d6680e5d718824f04"

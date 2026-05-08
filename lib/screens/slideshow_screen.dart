@@ -15,7 +15,6 @@ import '../models/slideshow_config.dart';
 import '../providers/app_providers.dart';
 import '../services/cache_service.dart';
 import '../services/nasa_api_service.dart';
-import '../services/wallpaper_service.dart';
 import '../ui/app_theme.dart';
 import '../ui/cosmic_scaffold.dart';
 import '../widgets/space_loading.dart';
@@ -52,7 +51,12 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   bool _controlsVisible = true;
   bool _initialVisualReady = false;
   bool _startupCacheReady = false;
+  bool _waitingForNextSlide = false;
   DateTime _lastPointerWake = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime? _activeSlideShownAt;
+  int _autoAdvanceToken = 0;
+  int _slideActivationToken = 0;
+  int _slideshowSessionId = 0;
 
   VideoPlayerController? _videoController;
   VoidCallback? _videoListener;
@@ -63,6 +67,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   String? _videoStateNote;
   final Set<String> _failedImageSlides = <String>{};
   final Map<String, String?> _resolvedLaunchPreview = <String, String?>{};
+  final Map<String, String> _lockedSlideImageUrls = <String, String>{};
   final Set<String> _previewResolveInFlight = <String>{};
   final Set<String> _hdUpgradeReadyUrls = <String>{};
   final Set<String> _hdUpgradeInFlightUrls = <String>{};
@@ -72,6 +77,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   final Set<String> _timelineDates = <String>{};
   DateTime? _prefetchCursorDate;
   bool _prefetchInProgress = false;
+  Completer<void>? _prefetchCycleCompleter;
   bool _timelineAdvanceInProgress = false;
   int _cacheCurrentBytes = 0;
   int _appCacheBytes = 0;
@@ -85,8 +91,12 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
 
   static const _controlsHideDelay = Duration(seconds: 4);
   static const _pointerWakeDebounce = Duration(milliseconds: 250);
-  static const _fixedWorkingSetWindow = 5;
+  static const _prefetchAheadTarget = 10;
+  static const _fixedWorkingSetWindow = _prefetchAheadTarget;
   static final DateTime _firstApodDate = NasaApiService.firstApodDate;
+
+  bool _isSessionCurrent(int sessionId) =>
+      mounted && sessionId == _slideshowSessionId;
 
   String? _imageUrlForEntry(ApodEntry entry, {bool? lowInternetUsage}) =>
       entry.imageUrlFor(
@@ -106,6 +116,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   @override
   void initState() {
     super.initState();
+    _slideshowSessionId++;
     _startedAt = DateTime.now();
     _timeline.add(widget.initialEntry);
     _timelineDates.add(_dateKey(widget.initialEntry.date));
@@ -140,29 +151,18 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   }
 
   Future<void> _bootstrapSlideshow() async {
+    final sessionId = _slideshowSessionId;
     await _prepareInitialVisual(_timeline.first);
-    if (!mounted) return;
+    if (!_isSessionCurrent(sessionId)) return;
 
     setState(() {
       _initialVisualReady = true;
       _startupCacheReady = true;
+      _waitingForNextSlide = false;
     });
+    _activeSlideShownAt = DateTime.now();
     _activateSlideForIndex(0);
-    _tick();
-    final first = _timeline.first;
-    final lowInternetUsage = ref.read(lowInternetUsageModeProvider);
-    final firstFast = _fastImageUrlForEntry(
-      first,
-      lowInternetUsage: lowInternetUsage,
-    );
-    final firstHd = lowInternetUsage ? null : first.hdurl;
-    if (!lowInternetUsage &&
-        firstFast != null &&
-        firstHd != null &&
-        firstHd.trim().isNotEmpty &&
-        firstHd != firstFast) {
-      unawaited(_primeHdUpgrade(first));
-    }
+    _scheduleAutoAdvance(reason: 'bootstrap');
     unawaited(_prefetchAhead(reason: 'bootstrap'));
     unawaited(_syncDirectionalCache(reason: 'bootstrap'));
   }
@@ -183,28 +183,12 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     final start = i.clamp(0, _timeline.length - 1);
     final end = min(_timeline.length - 1, start + window);
     final urls = <String>{};
-    final hdCandidates = <ApodEntry>[];
-    final lowInternetUsage = ref.read(lowInternetUsageModeProvider);
     for (var idx = start; idx <= end; idx++) {
       final entry = _timeline[idx];
       final preview = _previewUrlForCaching(entry);
       if (preview != null && preview.trim().isNotEmpty) {
         urls.add(preview);
       }
-      if (!lowInternetUsage && entry.shouldRenderAsImage) {
-        final fast = _fastImageUrlForEntry(
-          entry,
-          lowInternetUsage: lowInternetUsage,
-        );
-        final hd = entry.hdurl;
-        if (fast != null && hd != null && hd.trim().isNotEmpty && hd != fast) {
-          urls.add(hd);
-          hdCandidates.add(entry);
-        }
-      }
-    }
-    for (final entry in hdCandidates) {
-      unawaited(_primeHdUpgrade(entry));
     }
     await ref
         .read(cacheServiceProvider)
@@ -214,27 +198,68 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
           pinnedUrls: urls,
         );
     if (!mounted) return;
-    await _refreshPrefetchStatus(urls);
+    await _refreshPrefetchStatus();
   }
 
-  /// Starts or refreshes the periodic frame-advance loop.
-  void _tick() {
+  bool _runDurationElapsed() =>
+      DateTime.now().difference(_startedAt) >= widget.runDuration;
+
+  void _cancelAutoAdvanceLoop() {
+    _autoAdvanceToken++;
     t?.cancel();
-    if (!playing) return;
+    t = null;
+  }
 
-    final interval = ref.read(slideshowIntervalProvider).clamp(8, 300);
-    t = Timer.periodic(Duration(seconds: interval), (_) {
-      if (!_startupCacheReady) return;
-      if (DateTime.now().difference(_startedAt) >= widget.runDuration) {
-        setState(() => playing = false);
-        t?.cancel();
-        return;
-      }
+  void _scheduleAutoAdvance({required String reason}) {
+    _autoAdvanceToken++;
+    final token = _autoAdvanceToken;
+    t?.cancel();
+    t = null;
 
-      // Video slides are allowed to complete naturally before advancing.
-      if (_awaitingVideoCompletion) return;
+    if (!playing || !_startupCacheReady) return;
+    if (_runDurationElapsed()) {
+      setState(() => playing = false);
+      return;
+    }
+    if (_awaitingVideoCompletion) return;
+    if (_timeline.isEmpty || i < 0 || i >= _timeline.length) return;
 
-      unawaited(_advanceToNext(stopWhenUnavailable: true));
+    final intervalSeconds = ref.read(slideshowIntervalProvider).clamp(8, 300);
+    final interval = Duration(seconds: intervalSeconds);
+    final shownAt = _activeSlideShownAt ?? DateTime.now();
+    final scheduledAt = shownAt.add(interval);
+    final delay = scheduledAt.difference(DateTime.now());
+    if (delay <= Duration.zero) {
+      unawaited(_autoAdvanceFromSchedule(token));
+      return;
+    }
+
+    t = Timer(delay, () {
+      unawaited(_autoAdvanceFromSchedule(token));
+    });
+  }
+
+  Future<void> _autoAdvanceFromSchedule(int token) async {
+    if (!mounted || token != _autoAdvanceToken || !playing) return;
+    if (_runDurationElapsed()) {
+      setState(() => playing = false);
+      _cancelAutoAdvanceLoop();
+      return;
+    }
+    if (_awaitingVideoCompletion) return;
+    final advanced = await _advanceToNext(
+      stopWhenUnavailable: false,
+      reason: 'timer_tick',
+    );
+    if (!mounted || token != _autoAdvanceToken || !playing) return;
+    if (advanced) return;
+    if (_runDurationElapsed()) {
+      setState(() => playing = false);
+      _cancelAutoAdvanceLoop();
+      return;
+    }
+    t = Timer(const Duration(seconds: 1), () {
+      unawaited(_autoAdvanceFromSchedule(token));
     });
   }
 
@@ -256,24 +281,36 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     _showControlsTemporarily();
   }
 
-  Future<void> _advanceToNext({required bool stopWhenUnavailable}) async {
-    if (_timelineAdvanceInProgress) return;
+  Future<bool> _advanceToNext({
+    required bool stopWhenUnavailable,
+    required String reason,
+  }) async {
+    if (_timelineAdvanceInProgress) return false;
+    final sessionId = _slideshowSessionId;
     _timelineAdvanceInProgress = true;
     try {
       if (i + 1 >= _timeline.length) {
-        await _prefetchAhead(minUpcoming: 1, reason: 'advance');
+        if (mounted) {
+          setState(() => _waitingForNextSlide = true);
+        }
+        await _prefetchAhead(minUpcoming: 1, reason: reason);
       }
-      if (!mounted) return;
+      if (!_isSessionCurrent(sessionId)) return false;
       if (i + 1 < _timeline.length) {
         _goToIndex(i + 1);
-        return;
+        return true;
       }
       if (stopWhenUnavailable) {
         setState(() => playing = false);
-        t?.cancel();
+        _cancelAutoAdvanceLoop();
+        setState(() => _waitingForNextSlide = false);
       }
+      return false;
     } finally {
       _timelineAdvanceInProgress = false;
+      if (mounted) {
+        setState(() => _waitingForNextSlide = false);
+      }
     }
   }
 
@@ -281,29 +318,25 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     if (_timeline.isEmpty) return;
     final safe = index.clamp(0, _timeline.length - 1);
     setState(() => i = safe);
+    _activeSlideShownAt = DateTime.now();
     _activateSlideForIndex(safe);
+
     final entry = _timeline[safe];
-    final lowInternetUsage = ref.read(lowInternetUsageModeProvider);
-    final fast = _fastImageUrlForEntry(
-      entry,
-      lowInternetUsage: lowInternetUsage,
-    );
-    final hd = lowInternetUsage ? null : entry.hdurl;
-    if (!lowInternetUsage &&
-        fast != null &&
-        hd != null &&
-        hd.trim().isNotEmpty &&
-        hd != fast &&
-        !_hdUpgradeReadyUrls.contains(hd)) {
+    if (safe > 0 && entry.shouldRenderAsImage) {
       unawaited(_primeHdUpgrade(entry));
     }
-    unawaited(_prefetchAhead(reason: 'step'));
+    unawaited(
+      _prefetchAhead(minUpcoming: _prefetchAheadTarget, reason: 'step'),
+    );
     unawaited(_syncDirectionalCache(reason: 'step'));
+    _scheduleAutoAdvance(reason: 'go_to_index');
   }
 
   void _activateSlideForIndex(int index) {
     if (_timeline.isEmpty) return;
     final entry = _timeline[index];
+    final activationToken = ++_slideActivationToken;
+    _lockActiveSlideImageUrl(entry, index: index);
     final key =
         '${entry.date.toIso8601String()}|${entry.mediaType}|${entry.url}|${entry.thumbnailUrl}';
     if (_activeSlideKey == key) return;
@@ -313,6 +346,14 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
 
     if (!entry.shouldRenderAsVideo) {
       _awaitingVideoCompletion = false;
+      if (index == 0) {
+        unawaited(
+          _upgradeFirstSlideToHdWhenReady(
+            entry,
+            activationToken: activationToken,
+          ),
+        );
+      }
       return;
     }
 
@@ -331,6 +372,68 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   String _dateKey(DateTime date) =>
       '${date.year.toString().padLeft(4, '0')}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')}';
 
+  String? _standardImageUrlForEntry(ApodEntry entry) {
+    final standard = entry.standardImageUrl;
+    if (standard != null && standard.trim().isNotEmpty) return standard;
+    final slideshow = entry.slideshowImageUrl;
+    if (slideshow != null && slideshow.trim().isNotEmpty) return slideshow;
+    final best = entry.bestImageUrl;
+    if (best != null && best.trim().isNotEmpty) return best;
+    return null;
+  }
+
+  String? _normalizedHdUrl(ApodEntry entry) {
+    final hd = entry.hdurl?.trim();
+    if (hd == null || hd.isEmpty) return null;
+    return hd;
+  }
+
+  String _slideImageKey(ApodEntry entry) => _dateKey(entry.date);
+
+  void _lockActiveSlideImageUrl(ApodEntry entry, {required int index}) {
+    if (!entry.shouldRenderAsImage) return;
+    final lowInternetUsage = ref.read(lowInternetUsageModeProvider);
+    final standard = _standardImageUrlForEntry(entry);
+    final hd = _normalizedHdUrl(entry);
+
+    String? locked;
+    if (index == 0 && !lowInternetUsage) {
+      locked = standard ?? entry.bestImageUrl;
+    } else if (lowInternetUsage) {
+      locked = standard ?? _fastImageUrlForEntry(entry, lowInternetUsage: true);
+    } else if (hd != null && _hdUpgradeReadyUrls.contains(hd)) {
+      locked = hd;
+    } else {
+      locked =
+          standard ?? _fastImageUrlForEntry(entry, lowInternetUsage: false);
+    }
+
+    if (locked == null || locked.trim().isEmpty) return;
+    _lockedSlideImageUrls[_slideImageKey(entry)] = locked;
+  }
+
+  Future<void> _upgradeFirstSlideToHdWhenReady(
+    ApodEntry entry, {
+    required int activationToken,
+  }) async {
+    if (ref.read(lowInternetUsageModeProvider)) return;
+    if (!entry.shouldRenderAsImage) return;
+    final hd = _normalizedHdUrl(entry);
+    if (hd == null) return;
+    final standard = _standardImageUrlForEntry(entry);
+    if (standard != null && standard == hd) return;
+
+    await _primeHdUpgrade(entry);
+    if (!mounted) return;
+    if (activationToken != _slideActivationToken) return;
+    if (i != 0) return;
+    if (!_hdUpgradeReadyUrls.contains(hd)) return;
+    if (_lockedSlideImageUrls[_slideImageKey(entry)] == hd) return;
+    setState(() {
+      _lockedSlideImageUrls[_slideImageKey(entry)] = hd;
+    });
+  }
+
   bool _isUsableTimelineEntry(ApodEntry entry) {
     if (!_isWithinDateBounds(entry.date)) return false;
     if (entry.shouldRenderAsVideo) return false;
@@ -345,18 +448,24 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     required String reason,
     int? minUpcoming,
   }) async {
-    if (_prefetchInProgress || _prefetchCursorDate == null) return;
+    if (_prefetchInProgress) {
+      await _prefetchCycleCompleter?.future;
+      return;
+    }
+    if (_prefetchCursorDate == null) return;
     final apiKey = ref.read(apiKeyProvider);
     if (apiKey == null || apiKey.trim().isEmpty) return;
 
-    final targetUpcoming = minUpcoming ?? _fixedWorkingSetWindow;
+    final targetUpcoming = minUpcoming ?? _prefetchAheadTarget;
     if ((_timeline.length - i - 1) >= targetUpcoming) return;
 
-    final lowInternetUsage = ref.read(lowInternetUsageModeProvider);
+    final sessionId = _slideshowSessionId;
     final api = ref.read(nasaApiServiceProvider);
     _prefetchInProgress = true;
+    _prefetchCycleCompleter = Completer<void>();
     try {
-      while (mounted && (_timeline.length - i - 1) < targetUpcoming) {
+      while (_isSessionCurrent(sessionId) &&
+          (_timeline.length - i - 1) < targetUpcoming) {
         final candidateDate = _prefetchCursorDate;
         if (candidateDate == null || !_isWithinDateBounds(candidateDate)) {
           break;
@@ -364,6 +473,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
 
         try {
           final entry = await api.fetchByDate(apiKey, candidateDate);
+          if (!_isSessionCurrent(sessionId)) return;
           _prefetchCursorDate = _shiftDate(candidateDate, _directionStep);
           if (!_isUsableTimelineEntry(entry)) {
             continue;
@@ -374,15 +484,15 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
           }
           _timeline.add(entry);
           _timelineDates.add(key);
-          unawaited(
-            ref
-                .read(cacheServiceProvider)
-                .warmEntry(
-                  entry,
-                  reason: '$reason:prefetch',
-                  lowInternetUsage: lowInternetUsage,
-                ),
-          );
+          // Slideshow prefetch always primes the non-HD URL first.
+          await ref
+              .read(cacheServiceProvider)
+              .warmEntry(
+                entry,
+                reason: '$reason:prefetch',
+                lowInternetUsage: true,
+              );
+          if (!_isSessionCurrent(sessionId)) return;
         } on NasaApiException catch (e) {
           if (e.shouldAbortDateSearch) {
             break;
@@ -395,12 +505,12 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
         }
       }
     } finally {
-      try {
-        await _syncDirectionalCache(reason: reason);
-      } finally {
-        _prefetchInProgress = false;
-        if (mounted) setState(() {});
-      }
+      _prefetchInProgress = false;
+      _prefetchCycleCompleter?.complete();
+      _prefetchCycleCompleter = null;
+      if (mounted) setState(() {});
+      unawaited(_syncDirectionalCache(reason: '$reason:prefetch_window'));
+      unawaited(_refreshPrefetchStatus());
     }
   }
 
@@ -431,7 +541,12 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
         if (value.playerState == PlayerState.ended) {
           _awaitingVideoCompletion = false;
           if (playing) {
-            unawaited(_advanceToNext(stopWhenUnavailable: true));
+            unawaited(
+              _advanceToNext(
+                stopWhenUnavailable: true,
+                reason: 'video_complete',
+              ),
+            );
           }
         }
       });
@@ -461,7 +576,9 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
       if (value.isCompleted) {
         _awaitingVideoCompletion = false;
         if (playing) {
-          unawaited(_advanceToNext(stopWhenUnavailable: true));
+          unawaited(
+            _advanceToNext(stopWhenUnavailable: true, reason: 'video_complete'),
+          );
         }
       }
     };
@@ -515,7 +632,8 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
 
   @override
   void dispose() {
-    t?.cancel();
+    _slideshowSessionId++;
+    _cancelAutoAdvanceLoop();
     _controlsTimer?.cancel();
     final cacheListener = _cacheDebugListener;
     if (cacheListener != null) {
@@ -573,6 +691,36 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
                   child: _buildSlideContent(e),
                 ),
               ),
+              if (_waitingForNextSlide)
+                Positioned(
+                  top: 16,
+                  left: 16,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 6,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withValues(alpha: 0.54),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: const Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                        SizedBox(width: 8),
+                        Text(
+                          'Loading next slide…',
+                          style: TextStyle(color: Colors.white70),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
               if (_showHud)
                 Positioned(
                   top: 14,
@@ -625,7 +773,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
                               _cacheLastTrimRemovedCount > 0 &&
                               _cacheLastTrimAt != null)
                             Text(
-                              'Last clean: -${_formatBytes(_cacheLastTrimRemovedBytes)} (${_cacheLastTrimRemovedCount})',
+                              'Last clean: -${_formatBytes(_cacheLastTrimRemovedBytes)} ($_cacheLastTrimRemovedCount)',
                               style: const TextStyle(color: Colors.white60),
                             ),
                         ],
@@ -672,6 +820,16 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
                           fontWeight: FontWeight.w600,
                         ),
                       ),
+                      if (e.copyrightNotice != null) ...[
+                        const SizedBox(height: 4),
+                        Text(
+                          'Image © ${e.copyrightNotice}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: Theme.of(context).textTheme.bodySmall
+                              ?.copyWith(color: Colors.white70),
+                        ),
+                      ],
                     ],
                   ),
                 ),
@@ -713,9 +871,10 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
                         onPressed: () async {
                           setState(() => playing = !playing);
                           if (playing) {
-                            _tick();
+                            _activeSlideShownAt = DateTime.now();
+                            _scheduleAutoAdvance(reason: 'resume_button');
                           } else {
-                            t?.cancel();
+                            _cancelAutoAdvanceLoop();
                           }
                           await _syncCurrentMediaPlayback();
                           _showControlsTemporarily();
@@ -726,7 +885,12 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
                       ),
                       IconButton(
                         onPressed: () {
-                          unawaited(_advanceToNext(stopWhenUnavailable: false));
+                          unawaited(
+                            _advanceToNext(
+                              stopWhenUnavailable: false,
+                              reason: 'manual_next',
+                            ),
+                          );
                           _showControlsTemporarily();
                         },
                         icon: const Icon(Icons.skip_next),
@@ -764,65 +928,40 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
   }
 
   Widget _buildImageSlide(ApodEntry entry) {
-    final lowInternetUsage = ref.read(lowInternetUsageModeProvider);
     final cacheManager = ref.read(cacheServiceProvider).imageCache;
-    final hdFallbackUrl = lowInternetUsage ? null : entry.bestImageUrl;
     final imageUrl = _effectiveSlideImageUrl(entry);
     if (imageUrl == null || imageUrl.trim().isEmpty) {
       _skipCurrentIfPossible(entry, reason: 'missing-image-url');
       return _spaceLoadingScreen(message: 'Image unavailable for this entry.');
     }
 
-    return CachedNetworkImage(
-      key: ValueKey('img_${entry.date.toIso8601String()}_$imageUrl'),
-      imageUrl: imageUrl,
-      cacheManager: cacheManager,
-      fit: BoxFit.cover,
-      placeholder: (_, _) => _spaceLoadingScreen(message: 'Loading image...'),
-      errorWidget: (_, _, _) {
-        if (hdFallbackUrl != null &&
-            hdFallbackUrl.trim().isNotEmpty &&
-            hdFallbackUrl != imageUrl) {
-          return CachedNetworkImage(
-            imageUrl: hdFallbackUrl,
-            cacheManager: cacheManager,
-            fit: BoxFit.cover,
-            placeholder: (_, _) =>
-                _spaceLoadingScreen(message: 'Loading fallback...'),
-            errorWidget: (_, _, _) {
-              _skipCurrentIfPossible(entry, reason: 'image-fallback-failed');
-              return _spaceLoadingScreen(
-                message: 'Unable to render this image. Skipping…',
-              );
-            },
-          );
-        }
-        _skipCurrentIfPossible(entry, reason: 'image-render-failed');
-        return _spaceLoadingScreen(
-          message: 'Unable to render this image. Skipping…',
-        );
-      },
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        CachedNetworkImage(
+          key: ValueKey('img_${entry.date.toIso8601String()}'),
+          imageUrl: imageUrl,
+          cacheManager: cacheManager,
+          fit: BoxFit.contain,
+          useOldImageOnUrlChange: true,
+          placeholder: (_, _) =>
+              _spaceLoadingScreen(message: 'Loading image...'),
+          errorWidget: (_, _, _) {
+            _skipCurrentIfPossible(entry, reason: 'image-render-failed');
+            return _spaceLoadingScreen(
+              message: 'Unable to render this image. Skipping…',
+            );
+          },
+        ),
+      ],
     );
   }
 
   String? _effectiveSlideImageUrl(ApodEntry entry) {
-    final lowInternetUsage = ref.read(lowInternetUsageModeProvider);
-    final fast = _fastImageUrlForEntry(
-      entry,
-      lowInternetUsage: lowInternetUsage,
-    );
-    if (lowInternetUsage) return fast;
-    if (fast == null || fast.trim().isEmpty) {
-      return entry.imageUrlFor(lowInternetUsage: false);
-    }
-    final hd = entry.hdurl;
-    if (hd != null &&
-        hd.trim().isNotEmpty &&
-        hd != fast &&
-        _hdUpgradeReadyUrls.contains(hd)) {
-      return hd;
-    }
-    return fast;
+    final key = _slideImageKey(entry);
+    final locked = _lockedSlideImageUrls[key];
+    if (locked != null && locked.trim().isNotEmpty) return locked;
+    return _standardImageUrlForEntry(entry) ?? entry.bestImageUrl;
   }
 
   void _skipCurrentIfPossible(ApodEntry entry, {required String reason}) {
@@ -834,7 +973,12 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
       if (_timeline.length <= 1) return;
       if (i < 0 || i >= _timeline.length) return;
       if (_timeline[i].date != entry.date) return;
-      unawaited(_advanceToNext(stopWhenUnavailable: true));
+      unawaited(
+        _advanceToNext(
+          stopWhenUnavailable: true,
+          reason: 'image_render_failed',
+        ),
+      );
     });
   }
 
@@ -984,8 +1128,8 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
 
   Future<void> _primeHdUpgrade(ApodEntry entry) async {
     if (ref.read(lowInternetUsageModeProvider)) return;
-    final hd = entry.hdurl;
-    final fast = _fastImageUrlForEntry(entry, lowInternetUsage: false);
+    final hd = _normalizedHdUrl(entry);
+    final fast = _standardImageUrlForEntry(entry);
     if (hd == null || hd.trim().isEmpty || hd == fast) return;
     if (_hdUpgradeReadyUrls.contains(hd) ||
         _hdUpgradeInFlightUrls.contains(hd)) {
@@ -999,27 +1143,24 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
         await cache.downloadFile(hd);
       }
       _hdUpgradeReadyUrls.add(hd);
-      if (mounted) setState(() {});
+      if (mounted) {
+        setState(() {});
+      }
     } catch (_) {
       // Keep slideshow smooth even if HD upgrade fails.
     } finally {
       _hdUpgradeInFlightUrls.remove(hd);
+      unawaited(_refreshPrefetchStatus());
     }
   }
 
-  Future<void> _refreshPrefetchStatus(Set<String> urls) async {
-    final cache = ref.read(cacheServiceProvider).imageCache;
-    final checks = await Future.wait(
-      urls.map((url) => cache.getFileFromCache(url)),
-      eagerError: false,
-    );
-    var ready = 0;
-    for (final cached in checks) {
-      if (cached != null) ready++;
-    }
+  Future<void> _refreshPrefetchStatus() async {
+    final target = _prefetchAheadTarget;
+    final ready = max(0, _timeline.length - i - 1).clamp(0, target).toInt();
+
     if (!mounted) return;
     setState(() {
-      _prefetchTargetCount = urls.length;
+      _prefetchTargetCount = target;
       _prefetchReadyCount = ready;
     });
   }
@@ -1154,7 +1295,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     final wasPlaying = playing;
     if (wasPlaying) {
       setState(() => playing = false);
-      t?.cancel();
+      _cancelAutoAdvanceLoop();
       await _syncCurrentMediaPlayback();
     }
 
@@ -1164,6 +1305,19 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
           .imageCache
           .getSingleFile(imageUrl);
       if (!context.mounted) return;
+      final platformTargetSize = await wallpaperService
+          .getPlatformWallpaperTargetSize();
+      if (!context.mounted) return;
+      final setup = await showWallpaperSetupOverlay(
+        context,
+        sourcePath: file.path,
+        title: entry.title,
+        copyrightNotice: entry.copyrightNotice,
+        platformTargetSize: platformTargetSize,
+      );
+      if (!context.mounted || setup == null || !setup.applied) return;
+      final outputPath = setup.outputPath ?? file.path;
+
       if (Platform.isAndroid) {
         final confirm = await showDialog<bool>(
           context: context,
@@ -1186,7 +1340,7 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
         );
         if (!context.mounted || confirm != true) return;
         final msg = await wallpaperService.openAndroidSystemWallpaperPicker(
-          file.path,
+          outputPath,
         );
         if (!context.mounted) return;
         ScaffoldMessenger.of(
@@ -1194,17 +1348,6 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
         ).showSnackBar(SnackBar(content: Text(msg)));
         return;
       }
-      final platformTargetSize = await wallpaperService
-          .getPlatformWallpaperTargetSize();
-      if (!context.mounted) return;
-      final setup = await showWallpaperSetupOverlay(
-        context,
-        sourcePath: file.path,
-        title: entry.title,
-        platformTargetSize: platformTargetSize,
-      );
-      if (!context.mounted || setup == null || !setup.applied) return;
-      final outputPath = setup.outputPath ?? file.path;
 
       final msg = await wallpaperService.setImageWallpaper(
         outputPath,
@@ -1215,7 +1358,8 @@ class _SlideshowScreenState extends ConsumerState<SlideshowScreen> {
     } finally {
       if (wasPlaying && mounted) {
         setState(() => playing = true);
-        _tick();
+        _activeSlideShownAt = DateTime.now();
+        _scheduleAutoAdvance(reason: 'wallpaper_resume');
         await _syncCurrentMediaPlayback();
       }
     }

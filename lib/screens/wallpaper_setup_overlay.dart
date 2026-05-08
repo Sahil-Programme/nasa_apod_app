@@ -9,6 +9,14 @@ import '../services/wallpaper_service.dart';
 import '../ui/app_theme.dart';
 import '../widgets/space_loading.dart';
 
+enum WallpaperCopyrightPosition {
+  topLeft,
+  topRight,
+  center,
+  bottomLeft,
+  bottomRight,
+}
+
 class WallpaperSetupResult {
   const WallpaperSetupResult({
     required this.applied,
@@ -25,8 +33,11 @@ Future<WallpaperSetupResult?> showWallpaperSetupOverlay(
   BuildContext context, {
   required String sourcePath,
   required String title,
+  String? copyrightNotice,
   WallpaperFit initialStyle = WallpaperFit.fill,
   WallpaperTargetSize? platformTargetSize,
+  WallpaperCopyrightPosition initialCopyrightPosition =
+      WallpaperCopyrightPosition.bottomRight,
 }) {
   return Navigator.of(context).push<WallpaperSetupResult>(
     MaterialPageRoute(
@@ -34,8 +45,10 @@ Future<WallpaperSetupResult?> showWallpaperSetupOverlay(
       builder: (_) => WallpaperSetupOverlay(
         sourcePath: sourcePath,
         title: title,
+        copyrightNotice: copyrightNotice,
         initialStyle: initialStyle,
         platformTargetSize: platformTargetSize,
+        initialCopyrightPosition: initialCopyrightPosition,
       ),
     ),
   );
@@ -46,14 +59,18 @@ class WallpaperSetupOverlay extends StatefulWidget {
     super.key,
     required this.sourcePath,
     required this.title,
+    this.copyrightNotice,
     this.initialStyle = WallpaperFit.fill,
     this.platformTargetSize,
+    this.initialCopyrightPosition = WallpaperCopyrightPosition.bottomRight,
   });
 
   final String sourcePath;
   final String title;
+  final String? copyrightNotice;
   final WallpaperFit initialStyle;
   final WallpaperTargetSize? platformTargetSize;
+  final WallpaperCopyrightPosition initialCopyrightPosition;
 
   @override
   State<WallpaperSetupOverlay> createState() => _WallpaperSetupOverlayState();
@@ -78,6 +95,15 @@ class _WallpaperSetupOverlayState extends State<WallpaperSetupOverlay> {
   Offset _gestureContentPoint = Offset.zero;
 
   late WallpaperFit _style;
+  late WallpaperCopyrightPosition _copyrightPosition;
+
+  String? get _copyrightOverlayText {
+    final notice = widget.copyrightNotice?.trim();
+    if (notice == null || notice.isEmpty) return null;
+    return '© $notice';
+  }
+
+  bool get _requiresCopyrightOverlay => _copyrightOverlayText != null;
 
   bool get _isCanvasMode => Platform.isAndroid || Platform.isWindows;
 
@@ -93,6 +119,7 @@ class _WallpaperSetupOverlayState extends State<WallpaperSetupOverlay> {
   void initState() {
     super.initState();
     _style = widget.initialStyle;
+    _copyrightPosition = widget.initialCopyrightPosition;
     _loadImage();
   }
 
@@ -254,6 +281,16 @@ class _WallpaperSetupOverlayState extends State<WallpaperSetupOverlay> {
       Paint()..filterQuality = FilterQuality.high,
     );
 
+    final copyrightText = _copyrightOverlayText;
+    if (copyrightText != null) {
+      _paintCopyrightOverlay(
+        canvas,
+        outputRect,
+        text: copyrightText,
+        position: _copyrightPosition,
+      );
+    }
+
     final picture = recorder.endRecording();
     final rendered = await picture.toImage(outW, outH);
     final data = await rendered.toByteData(format: ui.ImageByteFormat.png);
@@ -270,6 +307,91 @@ class _WallpaperSetupOverlayState extends State<WallpaperSetupOverlay> {
     return outputPath;
   }
 
+  void _paintCopyrightOverlay(
+    Canvas canvas,
+    Rect bounds, {
+    required String text,
+    required WallpaperCopyrightPosition position,
+  }) {
+    final shortest = min(bounds.width, bounds.height);
+    final edgePadding = max(16.0, shortest * 0.03);
+    final innerPaddingH = max(10.0, shortest * 0.015);
+    final innerPaddingV = max(6.0, shortest * 0.010);
+    final fontSize = shortest.clamp(220.0, 2400.0) * 0.035;
+    final maxTextWidth = max(80.0, bounds.width - (edgePadding * 2));
+
+    final paragraph =
+        (ui.ParagraphBuilder(
+                ui.ParagraphStyle(
+                  textDirection: TextDirection.ltr,
+                  maxLines: 3,
+                  ellipsis: '…',
+                ),
+              )
+              ..pushStyle(
+                ui.TextStyle(
+                  color: Colors.white,
+                  fontSize: fontSize,
+                  fontWeight: FontWeight.w600,
+                  shadows: const [
+                    ui.Shadow(
+                      color: Color(0xB0000000),
+                      offset: Offset(0, 1.6),
+                      blurRadius: 4,
+                    ),
+                  ],
+                ),
+              )
+              ..addText(text))
+            .build()
+          ..layout(ui.ParagraphConstraints(width: maxTextWidth));
+
+    final boxWidth = min(
+      bounds.width - (edgePadding * 2),
+      paragraph.maxIntrinsicWidth + (innerPaddingH * 2),
+    );
+    final boxHeight = paragraph.height + (innerPaddingV * 2);
+    final dx = switch (position) {
+      WallpaperCopyrightPosition.topLeft ||
+      WallpaperCopyrightPosition.bottomLeft => bounds.left + edgePadding,
+      WallpaperCopyrightPosition.topRight ||
+      WallpaperCopyrightPosition.bottomRight =>
+        bounds.right - edgePadding - boxWidth,
+      WallpaperCopyrightPosition.center =>
+        bounds.left + ((bounds.width - boxWidth) / 2),
+    };
+    final dy = switch (position) {
+      WallpaperCopyrightPosition.topLeft ||
+      WallpaperCopyrightPosition.topRight => bounds.top + edgePadding,
+      WallpaperCopyrightPosition.bottomLeft ||
+      WallpaperCopyrightPosition.bottomRight =>
+        bounds.bottom - edgePadding - boxHeight,
+      WallpaperCopyrightPosition.center =>
+        bounds.top + ((bounds.height - boxHeight) / 2),
+    };
+    final backgroundRect = Rect.fromLTWH(dx, dy, boxWidth, boxHeight);
+
+    final background = Paint()..color = const Color(0x88000000);
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(backgroundRect, const Radius.circular(10)),
+      background,
+    );
+
+    final textDx = backgroundRect.left + innerPaddingH;
+    final textDy = backgroundRect.top + innerPaddingV;
+    canvas.drawParagraph(paragraph, Offset(textDx, textDy));
+  }
+
+  Alignment _overlayAlignment(WallpaperCopyrightPosition position) {
+    return switch (position) {
+      WallpaperCopyrightPosition.topLeft => Alignment.topLeft,
+      WallpaperCopyrightPosition.topRight => Alignment.topRight,
+      WallpaperCopyrightPosition.center => Alignment.center,
+      WallpaperCopyrightPosition.bottomLeft => Alignment.bottomLeft,
+      WallpaperCopyrightPosition.bottomRight => Alignment.bottomRight,
+    };
+  }
+
   void _onScaleStart(ScaleStartDetails details) {
     if (_image == null || _cropSize.isEmpty) return;
     _gestureStartScale = _scale;
@@ -281,9 +403,9 @@ class _WallpaperSetupOverlayState extends State<WallpaperSetupOverlay> {
   void _onScaleUpdate(ScaleUpdateDetails details) {
     if (_image == null || _cropSize.isEmpty || _exporting) return;
     final center = _cropSize.center(Offset.zero);
-    final nextScale =
-        (_gestureStartScale * details.scale).clamp(_minScale, _maxScale)
-            as double;
+    final nextScale = (_gestureStartScale * details.scale)
+        .clamp(_minScale, _maxScale)
+        .toDouble();
     final rawOffset =
         details.localFocalPoint - center - (_gestureContentPoint * nextScale);
 
@@ -309,9 +431,12 @@ class _WallpaperSetupOverlayState extends State<WallpaperSetupOverlay> {
       );
     } catch (_) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Could not prepare wallpaper image.')),
-      );
+      final message = _requiresCopyrightOverlay
+          ? 'Could not apply required copyright overlay. Wallpaper not exported.'
+          : 'Could not prepare wallpaper image.';
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(message)));
       setState(() => _exporting = false);
     }
   }
@@ -428,6 +553,39 @@ class _WallpaperSetupOverlayState extends State<WallpaperSetupOverlay> {
                             });
                           },
                   ),
+                  if (_requiresCopyrightOverlay) ...[
+                    const SizedBox(height: 6),
+                    Text(
+                      'Copyright Position',
+                      style: Theme.of(
+                        context,
+                      ).textTheme.bodySmall?.copyWith(color: Colors.white70),
+                    ),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: WallpaperCopyrightPosition.values.map((pos) {
+                        return ChoiceChip(
+                          label: Text(switch (pos) {
+                            WallpaperCopyrightPosition.topLeft => 'Top Left',
+                            WallpaperCopyrightPosition.topRight => 'Top Right',
+                            WallpaperCopyrightPosition.center => 'Center',
+                            WallpaperCopyrightPosition.bottomLeft =>
+                              'Bottom Left',
+                            WallpaperCopyrightPosition.bottomRight =>
+                              'Bottom Right',
+                          }),
+                          selected: _copyrightPosition == pos,
+                          onSelected: (_image == null || _exporting)
+                              ? null
+                              : (_) {
+                                  setState(() => _copyrightPosition = pos);
+                                },
+                        );
+                      }).toList(),
+                    ),
+                  ],
                   const SizedBox(height: 8),
                   SizedBox(
                     width: double.infinity,
@@ -487,18 +645,56 @@ class _WallpaperSetupOverlayState extends State<WallpaperSetupOverlay> {
       onScaleUpdate: _onScaleUpdate,
       child: Container(
         color: Colors.black,
-        child: Center(
-          child: Transform.translate(
-            offset: _offset,
-            child: Transform.scale(
-              scale: _scale,
-              child: SizedBox(
-                width: image.width.toDouble(),
-                height: image.height.toDouble(),
-                child: RawImage(image: image),
+        child: Stack(
+          children: [
+            Center(
+              child: Transform.translate(
+                offset: _offset,
+                child: Transform.scale(
+                  scale: _scale,
+                  child: SizedBox(
+                    width: image.width.toDouble(),
+                    height: image.height.toDouble(),
+                    child: RawImage(image: image),
+                  ),
+                ),
               ),
             ),
-          ),
+            if (_requiresCopyrightOverlay)
+              Align(
+                alignment: _overlayAlignment(_copyrightPosition),
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 6,
+                    ),
+                    constraints: const BoxConstraints(maxWidth: 280),
+                    decoration: BoxDecoration(
+                      color: const Color(0x88000000),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text(
+                      _copyrightOverlayText!,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w600,
+                        shadows: [
+                          Shadow(
+                            color: Color(0xB0000000),
+                            blurRadius: 3,
+                            offset: Offset(0, 1.2),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+          ],
         ),
       ),
     );

@@ -31,10 +31,6 @@ class HomeScreen extends ConsumerStatefulWidget {
 
 class _HomeScreenState extends ConsumerState<HomeScreen> {
   static final DateTime _firstApodDate = DateTime(1995, 6, 16);
-  // APOD allows 1000 requests/hour, but slideshow playback uses range fetches.
-  // This cap prevents oversized range payloads and keeps startup responsive.
-  static const _maxSlideshowItems = 1000; // APOD API limit
-  static const _initialSlideshowFetchTarget = 14;
   static const _minSlideshowDurationMinutes = 5.0;
   static const _maxSlideshowDurationMinutes = 300.0;
 
@@ -84,6 +80,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 context,
                 current,
                 keyId: const ValueKey('home_workspace_phone_portrait'),
+                reserveBottomDockClearance: true,
               ),
             ),
             if (_portraitActionsOpen)
@@ -132,6 +129,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               context,
               current,
               keyId: const ValueKey('home_workspace'),
+              reserveBottomDockClearance: false,
             ),
           ),
         ],
@@ -278,38 +276,43 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               alignment: _portraitActionsOpen
                   ? Alignment.topCenter
                   : Alignment.bottomCenter,
-              child: Material(
-                color: Colors.transparent,
-                child: InkWell(
-                  borderRadius: BorderRadius.circular(26),
-                  onTap: () {
-                    setState(
-                      () => _portraitActionsOpen = !_portraitActionsOpen,
-                    );
-                  },
-                  child: Ink(
-                    width: 52,
-                    height: 52,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: AppTheme.accent,
-                      boxShadow: [
-                        BoxShadow(
-                          color: AppTheme.accent.withValues(alpha: 0.35),
-                          blurRadius: 14,
-                          offset: const Offset(0, 6),
-                        ),
-                      ],
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  boxShadow: [
+                    BoxShadow(
+                      color: AppTheme.accent.withValues(alpha: 0.42),
+                      blurRadius: 18,
+                      spreadRadius: 1.6,
                     ),
-                    child: AnimatedSwitcher(
-                      duration: const Duration(milliseconds: 300),
-                      switchInCurve: Curves.easeOutCubic,
-                      switchOutCurve: Curves.easeInCubic,
-                      child: Icon(
-                        _portraitActionsOpen ? Icons.close : Icons.add,
-                        key: ValueKey(_portraitActionsOpen),
-                        color: AppTheme.bg,
-                        size: 24,
+                  ],
+                ),
+                child: Material(
+                  color: AppTheme.accent,
+                  shape: const CircleBorder(),
+                  clipBehavior: Clip.antiAlias,
+                  child: InkWell(
+                    customBorder: const CircleBorder(),
+                    onTap: () {
+                      setState(
+                        () => _portraitActionsOpen = !_portraitActionsOpen,
+                      );
+                    },
+                    child: SizedBox(
+                      width: 52,
+                      height: 52,
+                      child: Center(
+                        child: AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 300),
+                          switchInCurve: Curves.easeOutCubic,
+                          switchOutCurve: Curves.easeInCubic,
+                          child: Icon(
+                            _portraitActionsOpen ? Icons.close : Icons.add,
+                            key: ValueKey(_portraitActionsOpen),
+                            color: AppTheme.bg,
+                            size: 24,
+                          ),
+                        ),
                       ),
                     ),
                   ),
@@ -608,6 +611,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     BuildContext context,
     AsyncValue<ApodEntry?> current, {
     required Key keyId,
+    required bool reserveBottomDockClearance,
   }) {
     return Container(
       key: keyId,
@@ -626,7 +630,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               child: current.when(
                 data: (entry) => entry == null
                     ? _emptyPanel(context)
-                    : _buildHomeEntryPanel(context, entry),
+                    : _buildHomeEntryPanel(
+                        context,
+                        entry,
+                        reserveBottomDockClearance: reserveBottomDockClearance,
+                      ),
                 loading: () => const Center(
                   child: SpaceLoadingIndicator(
                     semanticLabel: 'Loading APOD entry',
@@ -641,13 +649,21 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     );
   }
 
-  Widget _buildHomeEntryPanel(BuildContext context, ApodEntry entry) {
+  Widget _buildHomeEntryPanel(
+    BuildContext context,
+    ApodEntry entry, {
+    required bool reserveBottomDockClearance,
+  }) {
     return LayoutBuilder(
       builder: (context, constraints) {
         final isWide = constraints.maxWidth >= 1080;
         final isPortrait = constraints.maxHeight > constraints.maxWidth;
         final mediaCard = _buildHomeMediaPanel(context, entry);
-        final infoCard = _buildHomeInfoPanel(context, entry);
+        final infoCard = _buildHomeInfoPanel(
+          context,
+          entry,
+          reserveBottomDockClearance: reserveBottomDockClearance,
+        );
         if (isWide) {
           return Row(
             crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -747,7 +763,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     );
   }
 
-  Widget _buildHomeInfoPanel(BuildContext context, ApodEntry entry) {
+  Widget _buildHomeInfoPanel(
+    BuildContext context,
+    ApodEntry entry, {
+    required bool reserveBottomDockClearance,
+  }) {
     final dateText = _formatDate(entry.date);
     return Container(
       decoration: BoxDecoration(
@@ -776,14 +796,30 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 context,
               ).textTheme.bodyMedium?.copyWith(color: AppTheme.accentSoft),
             ),
+            if (entry.copyrightNotice != null) ...[
+              const SizedBox(height: 6),
+              Text(
+                'Image © ${entry.copyrightNotice}',
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(
+                  context,
+                ).textTheme.bodyMedium?.copyWith(color: Colors.white70),
+              ),
+            ],
             const SizedBox(height: 10),
             Expanded(
               child: SingleChildScrollView(
-                child: Text(
-                  entry.explanation,
-                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    color: Colors.white70,
-                    height: 1.4,
+                child: Padding(
+                  padding: EdgeInsets.only(
+                    bottom: reserveBottomDockClearance ? 84 : 0,
+                  ),
+                  child: Text(
+                    entry.explanation,
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      color: Colors.white70,
+                      height: 1.4,
+                    ),
                   ),
                 ),
               ),
@@ -941,104 +977,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     }
   }
 
-  ({DateTime start, DateTime end}) _slideshowRangeForCount({
-    required DateTime anchor,
-    required SlideshowDirection direction,
-    required int count,
-    required DateTime latestAvailableDate,
-  }) {
-    final days = max(0, count - 1);
-    var start = anchor;
-    var end = anchor;
-
-    if (direction == SlideshowDirection.forward) {
-      end = anchor.add(Duration(days: days));
-      if (end.isAfter(latestAvailableDate)) end = latestAvailableDate;
-    } else {
-      start = anchor.subtract(Duration(days: days));
-      if (start.isBefore(_firstApodDate)) start = _firstApodDate;
-    }
-
-    return (start: start, end: end);
-  }
-
-  Future<List<ApodEntry>> _fetchSlideshowRange(
-    String apiKey,
-    DateTime start,
-    DateTime end, {
-    int maxDateFallbacks = 0,
-  }) async {
-    try {
-      return await ref
-          .read(nasaApiServiceProvider)
-          .fetchRange(apiKey, start, end);
-    } catch (e) {
-      // If NASA rejects the range boundary (common near timezone edges),
-      // retry once with an end date shifted back by one day.
-      if (end.isAfter(start)) {
-        try {
-          return await ref
-              .read(nasaApiServiceProvider)
-              .fetchRange(apiKey, start, end.subtract(const Duration(days: 1)));
-        } catch (retryError) {
-          if (maxDateFallbacks > 0 &&
-              _isRecoverableSlideshowFetchError(retryError)) {
-            return _fetchSlideshowDatesIndividually(
-              apiKey,
-              start,
-              end,
-              maxDates: maxDateFallbacks,
-            );
-          }
-          rethrow;
-        }
-      }
-      if (maxDateFallbacks > 0 && _isRecoverableSlideshowFetchError(e)) {
-        return _fetchSlideshowDatesIndividually(
-          apiKey,
-          start,
-          end,
-          maxDates: maxDateFallbacks,
-        );
-      }
-      rethrow;
-    }
-  }
-
-  Future<List<ApodEntry>> _fetchSlideshowDatesIndividually(
-    String apiKey,
-    DateTime start,
-    DateTime end, {
-    required int maxDates,
-  }) async {
-    final api = ref.read(nasaApiServiceProvider);
-    final items = <ApodEntry>[];
-    final startDay = DateTime(start.year, start.month, start.day);
-    final endDay = DateTime(end.year, end.month, end.day);
-    final totalDays = endDay.difference(startDay).inDays + 1;
-    final safeCount = min(max(0, totalDays), maxDates);
-    Object? lastError;
-
-    for (var offset = 0; offset < safeCount; offset++) {
-      final date = startDay.add(Duration(days: offset));
-      try {
-        items.add(await api.fetchByDate(apiKey, date));
-      } on NasaApiException catch (e) {
-        if (!_isRecoverableNasaIssue(e) && e.shouldAbortDateSearch) rethrow;
-        lastError = e;
-      } catch (e) {
-        lastError = e;
-      }
-    }
-
-    if (items.isNotEmpty) return items;
-    if (lastError is Exception) throw lastError;
-    throw StateError('No APOD entries were available for slideshow fallback.');
-  }
-
-  bool _isRecoverableSlideshowFetchError(Object error) =>
-      error is NasaApiException && _isRecoverableNasaIssue(error);
-
   bool _isRecoverableNasaIssue(NasaApiException error) =>
       error.kind == NasaApiFailureKind.server ||
       error.kind == NasaApiFailureKind.network;
@@ -1062,48 +1000,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           false;
     }
     return entry.launchUrl != null || entry.thumbnailUrl != null;
-  }
-
-  List<ApodEntry> _sanitizeAndOrderSlideshowItems(
-    List<ApodEntry> items, {
-    required SlideshowDirection direction,
-    required DateTime latestAvailableDate,
-  }) {
-    final sanitized = items
-        .where(
-          (entry) => _isValidSlideshowEntry(
-            entry,
-            latestAvailableDate: latestAvailableDate,
-          ),
-        )
-        .toList(growable: false);
-    final sorted = [...sanitized]..sort((a, b) => a.date.compareTo(b.date));
-    return direction == SlideshowDirection.forward
-        ? sorted
-        : sorted.reversed.toList(growable: false);
-  }
-
-  Future<void> _loadRemainingSlideshowItems({
-    required String apiKey,
-    required int token,
-    required DateTime start,
-    required DateTime end,
-    required SlideshowDirection direction,
-    required DateTime latestAvailableDate,
-  }) async {
-    try {
-      final items = await _fetchSlideshowRange(apiKey, start, end);
-      if (!mounted || token != _slideshowLaunchToken) return;
-      final ordered = _sanitizeAndOrderSlideshowItems(
-        items,
-        direction: direction,
-        latestAvailableDate: latestAvailableDate,
-      );
-      if (ordered.length <= ref.read(slideshowEntriesProvider).length) return;
-      ref.read(slideshowEntriesProvider.notifier).state = ordered;
-    } catch (_) {
-      // The slideshow can continue with the already loaded launch window.
-    }
   }
 
   void _showSlideshowStartingDialog(BuildContext context) {
@@ -1644,6 +1540,19 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         .imageCache
         .getSingleFile(imageUrl);
     if (!context.mounted) return;
+    final platformTargetSize = await wallpaperService
+        .getPlatformWallpaperTargetSize();
+    if (!context.mounted) return;
+    final setup = await showWallpaperSetupOverlay(
+      context,
+      sourcePath: file.path,
+      title: entry.title,
+      copyrightNotice: entry.copyrightNotice,
+      platformTargetSize: platformTargetSize,
+    );
+    if (!context.mounted || setup == null || !setup.applied) return;
+    final outputPath = setup.outputPath ?? file.path;
+
     if (Platform.isAndroid) {
       final confirm = await showDialog<bool>(
         context: context,
@@ -1666,23 +1575,12 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       );
       if (!context.mounted || confirm != true) return;
       final msg = await wallpaperService.openAndroidSystemWallpaperPicker(
-        file.path,
+        outputPath,
       );
       if (!context.mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
       return;
     }
-    final platformTargetSize = await wallpaperService
-        .getPlatformWallpaperTargetSize();
-    if (!context.mounted) return;
-    final setup = await showWallpaperSetupOverlay(
-      context,
-      sourcePath: file.path,
-      title: entry.title,
-      platformTargetSize: platformTargetSize,
-    );
-    if (!context.mounted || setup == null || !setup.applied) return;
-    final outputPath = setup.outputPath ?? file.path;
 
     final msg = await wallpaperService.setImageWallpaper(
       outputPath,
